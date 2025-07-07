@@ -10,6 +10,9 @@ const helmet = require('helmet');
 const compression = require('compression');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
+const { supabase } = require('./config/supabase');
+const { authenticateToken } = require('./middleware/auth');
+const { asyncHandler } = require('./middleware/errorHandler');
 
 // Import routes
 const authRoutes = require('./routes/authRoutes');
@@ -86,6 +89,26 @@ app.use('/api/customer', customerLotsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/webhook/n8n', n8nWebhookRoutes);
 
+// GET /api/customer-info
+app.get('/api/customer-info', authenticateToken, asyncHandler(async (req, res) => {
+  const { data, error } = await supabase
+    .from('customer_info')
+    .select('*')
+    .order('customer_name', { ascending: true });
+  if (error) return res.status(500).json({ success: false, message: 'Failed to fetch customers', error: error.message });
+  res.json({ data: { customers: data } });
+}));
+
+// GET /api/broker-info
+app.get('/api/broker-info', authenticateToken, asyncHandler(async (req, res) => {
+  const { data, error } = await supabase
+    .from('broker_info')
+    .select('*')
+    .order('broker_name', { ascending: true });
+  if (error) return res.status(500).json({ success: false, message: 'Failed to fetch brokers', error: error.message });
+  res.json({ data: { brokers: data } });
+}));
+
 //backend health check
 app.get('/', (req, res) => {
   res.status(200).json({
@@ -104,8 +127,6 @@ app.use('*', (req, res) => {
 
 // Global error handler
 app.use(errorHandler);
-
-
 
 // Start server
 app.listen(PORT, () => {

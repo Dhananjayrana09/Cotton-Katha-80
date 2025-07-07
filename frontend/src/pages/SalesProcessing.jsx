@@ -31,6 +31,85 @@ const SalesProcessing = () => {
   const [processingSales, setProcessingSales] = useState(false)
   const [mode, setMode] = useState('list') // 'list', 'processing', 'selection', 'confirm'
 
+  // New Order state
+  const [showNewOrderForm, setShowNewOrderForm] = useState(false)
+  const [newOrder, setNewOrder] = useState({
+    customer_id: '',
+    broker_id: '',
+    requested_quantity: '',
+    lifting_period: '',
+    priority_branch: '',
+    line_items: [{ indent_number: '', quantity: '', commission_rate: '' }]
+  })
+  const [creatingOrder, setCreatingOrder] = useState(false)
+
+  // Fetch options for customer and broker dropdowns (optional, can be improved)
+  const [customerOptions, setCustomerOptions] = useState([])
+  const [brokerOptions, setBrokerOptions] = useState([])
+  useEffect(() => {
+    // Fetch customers
+    api.get('/customer-info')
+      .then(res => setCustomerOptions(res.data.data.customers || []))
+      .catch(() => setCustomerOptions([]))
+    // Fetch brokers
+    api.get('/broker-info')
+      .then(res => setBrokerOptions(res.data.data.brokers || []))
+      .catch(() => setBrokerOptions([]))
+  }, [])
+
+  // Handle new order form changes
+  const handleNewOrderChange = (field, value) => {
+    setNewOrder(prev => ({ ...prev, [field]: value }))
+  }
+  const handleLineItemChange = (idx, field, value) => {
+    setNewOrder(prev => {
+      const items = [...prev.line_items]
+      items[idx][field] = value
+      return { ...prev, line_items: items }
+    })
+  }
+  const addLineItem = () => {
+    setNewOrder(prev => ({ ...prev, line_items: [...prev.line_items, { indent_number: '', quantity: '', commission_rate: '' }] }))
+  }
+  const removeLineItem = (idx) => {
+    setNewOrder(prev => ({ ...prev, line_items: prev.line_items.filter((_, i) => i !== idx) }))
+  }
+
+  // Submit new order
+  const submitNewOrder = async (e) => {
+    e.preventDefault()
+    setCreatingOrder(true)
+    try {
+      // Validate fields (basic)
+      if (!newOrder.customer_id || !newOrder.broker_id || !newOrder.requested_quantity || !newOrder.lifting_period || newOrder.line_items.length === 0) {
+        toast.error('Please fill all required fields and add at least one line item')
+        setCreatingOrder(false)
+        return
+      }
+      // POST to backend
+      await api.post('/sales/new', {
+        ...newOrder,
+        requested_quantity: Number(newOrder.requested_quantity),
+        line_items: newOrder.line_items.map(item => ({
+          ...item,
+          quantity: Number(item.quantity),
+          commission_rate: Number(item.commission_rate)
+        }))
+      })
+      toast.success('Sales order created!')
+      setShowNewOrderForm(false)
+      setNewOrder({
+        customer_id: '', broker_id: '', requested_quantity: '', lifting_period: '', priority_branch: '',
+        line_items: [{ indent_number: '', quantity: '', commission_rate: '' }]
+      })
+      fetchPendingOrders()
+    } catch (error) {
+      toast.error(error.response?.data?.message || 'Failed to create order')
+    } finally {
+      setCreatingOrder(false)
+    }
+  }
+
   // Fetch pending sales orders
   const fetchPendingOrders = async () => {
     try {
@@ -178,6 +257,121 @@ const SalesProcessing = () => {
   if (mode === 'list') {
     return (
       <div className="space-y-6">
+        {/* New Order Section */}
+        <div className="bg-white p-4 rounded-lg shadow mb-6">
+          <div className="flex items-center justify-between">
+            <h2 className="text-xl font-bold text-gray-900">Create New Sales Order</h2>
+            <button className="btn-primary" onClick={() => setShowNewOrderForm(v => !v)}>
+              {showNewOrderForm ? 'Cancel' : 'New Order'}
+            </button>
+          </div>
+          {showNewOrderForm && (
+            <form className="mt-4 space-y-4" onSubmit={submitNewOrder}>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Customer</label>
+                  <select
+                    className="input-field"
+                    value={newOrder.customer_id}
+                    onChange={e => handleNewOrderChange('customer_id', e.target.value)}
+                    required
+                  >
+                    <option value="">Select Customer</option>
+                    {customerOptions.map(c => (
+                      <option key={c.id} value={c.id}>{c.customer_name} ({c.customer_code})</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Broker</label>
+                  <select
+                    className="input-field"
+                    value={newOrder.broker_id}
+                    onChange={e => handleNewOrderChange('broker_id', e.target.value)}
+                    required
+                  >
+                    <option value="">Select Broker</option>
+                    {brokerOptions.map(b => (
+                      <option key={b.id} value={b.id}>{b.broker_name} ({b.broker_code})</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Requested Quantity (bales)</label>
+                  <input
+                    type="number"
+                    className="input-field"
+                    value={newOrder.requested_quantity}
+                    onChange={e => handleNewOrderChange('requested_quantity', e.target.value)}
+                    min={1}
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Lifting Period</label>
+                  <input
+                    type="text"
+                    className="input-field"
+                    value={newOrder.lifting_period}
+                    onChange={e => handleNewOrderChange('lifting_period', e.target.value)}
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Priority Branch</label>
+                  <input
+                    type="text"
+                    className="input-field"
+                    value={newOrder.priority_branch}
+                    onChange={e => handleNewOrderChange('priority_branch', e.target.value)}
+                  />
+                </div>
+              </div>
+              {/* Line Items */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Line Items</label>
+                {newOrder.line_items.map((item, idx) => (
+                  <div key={idx} className="grid grid-cols-1 md:grid-cols-4 gap-2 mb-2 items-end">
+                    <input
+                      type="text"
+                      className="input-field"
+                      placeholder="Indent Number"
+                      value={item.indent_number}
+                      onChange={e => handleLineItemChange(idx, 'indent_number', e.target.value)}
+                      required
+                    />
+                    <input
+                      type="number"
+                      className="input-field"
+                      placeholder="Quantity"
+                      min={1}
+                      value={item.quantity}
+                      onChange={e => handleLineItemChange(idx, 'quantity', e.target.value)}
+                      required
+                    />
+                    <input
+                      type="number"
+                      className="input-field"
+                      placeholder="Commission Rate (%)"
+                      min={0}
+                      value={item.commission_rate}
+                      onChange={e => handleLineItemChange(idx, 'commission_rate', e.target.value)}
+                      required
+                    />
+                    <button type="button" className="btn-secondary" onClick={() => removeLineItem(idx)} disabled={newOrder.line_items.length === 1}>Remove</button>
+                  </div>
+                ))}
+                <button type="button" className="btn-primary mt-2" onClick={addLineItem}>Add Line Item</button>
+              </div>
+              <div className="flex justify-end">
+                <button type="submit" className="btn-primary" disabled={creatingOrder}>
+                  {creatingOrder ? 'Creating...' : 'Create Order'}
+                </button>
+              </div>
+            </form>
+          )}
+        </div>
+
         {/* Header */}
         <div className="border-b border-gray-200 pb-4">
           <h1 className="text-2xl font-bold text-gray-900">Sales Processing</h1>

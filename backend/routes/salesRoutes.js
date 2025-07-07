@@ -36,6 +36,23 @@ const confirmSaleSchema = Joi.object({
   notes: Joi.string().max(500).optional()
 });
 
+// Validation schema for new sales order
+const newOrderSchema = Joi.object({
+  customer_id: Joi.string().uuid().required(),
+  broker_id: Joi.string().uuid().required(),
+  order_date: Joi.date().default(() => new Date()),
+  requested_quantity: Joi.number().integer().min(1).required(),
+  lifting_period: Joi.string().required(),
+  priority_branch: Joi.string().optional(),
+  line_items: Joi.array().items(
+    Joi.object({
+      indent_number: Joi.string().required(),
+      quantity: Joi.number().integer().min(1).required(),
+      commission_rate: Joi.number().min(0).required()
+    })
+  ).min(1).required()
+});
+
 // Add safety check for n8n env variables at the top (we have to add the draft webhook later is used !process.env.N8N_DRAFT_WEBHOOK )
 if (!process.env.N8N_BASE_URL || !process.env.N8N_SALES_CONFIRMATION_WEBHOOK) {
   throw new Error('n8n webhook URLs are not configured in environment variables');
@@ -613,5 +630,145 @@ router.get('/:id',
     });
   })
 );
+
+/**
+ * @route   POST /api/sales/new
+ * @desc    Create a new sales order (sales configuration)
+ * @access  Private (Admin/Trader)
+ */
+router.post('/new', 
+  authenticateToken,
+  authorizeRoles('admin', 'trader'),
+  validateBody(newOrderSchema),
+  asyncHandler(async (req, res) => {
+    const { customer_id, broker_id, order_date, requested_quantity, lifting_period, priority_branch, line_items } = req.body;
+
+    // Validate customer
+    const { data: customer, error: customerError } = await supabase
+      .from('customer_info')
+      .select('*')
+      .eq('id', customer_id)
+      .single();
+    if (customerError || !customer) {
+      return res.status(404).json({ success: false, message: 'Customer not found' });
+    }
+
+    // Validate broker
+    const { data: broker, error: brokerError } = await supabase
+      .from('broker_info')
+      .select('*')
+      .eq('id', broker_id)
+      .single();
+    if (brokerError || !broker) {
+      return res.status(404).json({ success: false, message: 'Broker not found' });
+    }
+
+    // Validate and fetch indents for each line item
+    const indentNumbers = line_items.map(item => item.indent_number);
+    const { data: indents, error: indentError } = await supabase
+      .from('procurement_dump')
+      .select('*')
+      .in('indent_number', indentNumbers);
+    if (indentError) {
+      return res.status(500).json({ success: false, message: 'Failed to fetch indents', error: indentError.message });
+    }
+    if (!indents || indents.length !== line_items.length) {
+      return res.status(400).json({ success: false, message: 'One or more indents are invalid' });
+    }
+
+    // Build line specs (for filtering lots later)
+    const lineSpecs = {
+      variety: indents[0].variety, // Example: use first indent's specs
+      fibre_length: indents[0].fibre_length
+    };
+
+    // Create sales configuration
+    const { data: salesConfig, error: configError } = await supabase
+      .from('sales_configuration')
+      .insert({
+        customer_id,
+        broker_id,
+        order_date,
+        requested_quantity,
+        lifting_period,
+        priority_branch,
+        line_specs: lineSpecs,
+        status: 'pending',
+        created_by: req.user.id,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+    if (configError) {
+      return res.status(500).json({ success: false, message: 'Failed to create sales configuration', error: configError.message });
+    }
+
+    // Optionally, store line items in a separate table if needed
+    // ...
+
+    // Log creation
+    await supabase.from('audit_log').insert({
+      table_name: 'sales_configuration',
+      record_id: salesConfig.id,
+      action: 'SALES_ORDER_CREATED',
+      user_id: req.user.id,
+      new_values: { customer_id, broker_id, requested_quantity, lifting_period, priority_branch, line_items }
+    });
+
+    // Trigger n8n webhook for contract PDF/email
+    try {
+      const webhookUrl = process.env.N8N_SALES_CONTRACT_GENERATE_PDF_WEBHOOK || `${process.env.N8N_BASE_URL}${process.env.N8N_SALES_CONTRACT_GENERATE_PDF_WEBHOOK}`;
+      await axios.post(webhookUrl, {
+        sales_config_id: salesConfig.id,
+        customer,
+        broker,
+        line_items,
+        order_date,
+        requested_quantity,
+        lifting_period,
+        priority_branch,
+        created_by: req.user,
+      });
+      // Log CONTRACT_SENT
+      await supabase.from('audit_log').insert({
+        table_name: 'sales_configuration',
+        record_id: salesConfig.id,
+        action: 'CONTRACT_SENT',
+        user_id: req.user.id,
+        new_values: { webhook: 'triggered', customer_id, broker_id }
+      });
+    } catch (webhookError) {
+      console.error('n8n contract webhook failed:', webhookError);
+      // Do not block main flow
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Sales order created successfully',
+      data: { sales_config: salesConfig }
+    });
+  })
+);
+
+// GET /api/customer-info
+router.get('/customer-info', authenticateToken, asyncHandler(async (req, res) => {
+  const { data, error } = await supabase
+    .from('customer_info')
+    .select('*')
+    .order('customer_name', { ascending: true });
+  if (error) return res.status(500).json({ success: false, message: 'Failed to fetch customers', error: error.message });
+  res.json({ data: { customers: data } });
+}));
+
+// GET /api/broker-info
+router.get('/broker-info', authenticateToken, asyncHandler(async (req, res) => {
+  const { data, error } = await supabase
+    .from('broker_info')
+    .select('*')
+    .order('broker_name', { ascending: true });
+  if (error) return res.status(500).json({ success: false, message: 'Failed to fetch brokers', error: error.message });
+  res.json({ data: { brokers: data } });
+}));
 
 module.exports = router;
