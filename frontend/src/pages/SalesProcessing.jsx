@@ -118,7 +118,10 @@ const SalesProcessing = () => {
       setPendingOrders(response.data.data.orders)
     } catch (error) {
       console.error('Error fetching pending orders:', error)
-      toast.error('Failed to fetch pending orders')
+      // Only show toast for non-401 errors, as 401 is handled by global interceptor
+      if (error.response?.status !== 401) {
+        toast.error('Failed to fetch pending orders')
+      }
     } finally {
       setLoading(false)
     }
