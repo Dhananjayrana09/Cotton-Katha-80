@@ -138,12 +138,13 @@ router.post('/auto-select-lots',
       });
     }
 
-    // Calculate selection limits
-    const base = requested_qty;
-    const extra = Math.floor(base * 0.2);
+        // Calculate selection limits based on industry standard (6.12 bales per ton)
+    const balesPerTon = 6.12;
+    const base = Math.ceil(requested_qty * balesPerTon);
+    const extra = Math.floor(base * 0.2); // 20% extra for flexibility
     const maxLimit = base + extra;
 
-    // Build query for available lots
+    // Build query for available lots with enhanced selection
     let lotsQuery = supabase
       .from('inventory_table')
       .select(`
@@ -168,15 +169,42 @@ router.post('/auto-select-lots',
       }
     }
 
-    // Priority: same branch first
+    // Priority: same branch first (enhanced logic)
     if (salesConfig.priority_branch) {
-      lotsQuery = lotsQuery.eq('branch', salesConfig.priority_branch);
+      // First try to get lots from priority branch
+      const { data: priorityLots, error: priorityError } = await lotsQuery
+        .eq('branch', salesConfig.priority_branch)
+        .order('created_at', { ascending: true })
+        .limit(maxLimit);
+      
+      if (!priorityError && priorityLots && priorityLots.length >= base) {
+        // If we have enough lots from priority branch, return them
+        const autoSelected = priorityLots.slice(0, Math.min(maxLimit, priorityLots.length));
+        const totalValue = autoSelected.reduce((sum, lot) => sum + (lot.bid_price || 0), 0);
+
+        return res.json({
+          success: true,
+          data: {
+            sales_config: salesConfig,
+            available_lots: priorityLots,
+            auto_selected: autoSelected,
+            selection_limits: {
+              requested: requested_qty,
+              required_bales: base,
+              max_allowed: maxLimit,
+              auto_selected_count: autoSelected.length
+            },
+            total_value: totalValue,
+            out_of_stock: false,
+            priority_branch_used: true
+          }
+        });
+      }
     }
 
-    // Order by FIFO (first in, first out)
+    // Order by FIFO (first in, first out) and get all available lots
     lotsQuery = lotsQuery
-      .order('created_at', { ascending: true })
-      .limit(maxLimit);
+      .order('created_at', { ascending: true });
 
     const { data: availableLots, error: lotsError } = await lotsQuery;
 
@@ -200,25 +228,66 @@ router.post('/auto-select-lots',
       });
     }
 
-    // Auto-select lots (prioritize same branch)
-    const autoSelected = availableLots.slice(0, Math.min(maxLimit, availableLots.length));
+    // Auto-select lots with enhanced logic
+    let autoSelected = [];
+    
+    // If priority branch didn't have enough lots, try to get remaining from other branches
+    if (salesConfig.priority_branch && availableLots.length > 0) {
+      // Get priority branch lots first
+      const priorityLots = availableLots.filter(lot => lot.branch === salesConfig.priority_branch);
+      autoSelected = [...priorityLots];
+      
+      // Add remaining lots from other branches if needed
+      const remainingLots = availableLots.filter(lot => lot.branch !== salesConfig.priority_branch);
+      const needed = Math.max(0, base - autoSelected.length);
+      autoSelected = [...autoSelected, ...remainingLots.slice(0, needed)];
+    } else {
+      // No priority branch or no priority branch lots, select from all available
+      autoSelected = availableLots.slice(0, Math.min(maxLimit, availableLots.length));
+    }
 
+    // Fetch allocation details for each unique indent_number
+    const indentNumbers = [...new Set(availableLots.map(lot => lot.indent_number))];
+    let allocationDetailsMap = {};
+    if (indentNumbers.length > 0) {
+      const { data: allocations, error: allocationError } = await supabase
+        .from('allocation')
+        .select('*')
+        .in('indent_number', indentNumbers);
+      if (!allocationError && allocations) {
+        allocationDetailsMap = allocations.reduce((acc, alloc) => {
+          acc[alloc.indent_number] = alloc;
+          return acc;
+        }, {});
+      }
+    }
+    // Attach allocation details to each lot
+    const lotsWithAlloc = availableLots.map(lot => ({
+      ...lot,
+      allocation_details: allocationDetailsMap[lot.indent_number] || null
+    }));
+    const autoSelectedWithAlloc = autoSelected.map(lot => ({
+      ...lot,
+      allocation_details: allocationDetailsMap[lot.indent_number] || null
+    }));
     // Calculate total value
-    const totalValue = autoSelected.reduce((sum, lot) => sum + (lot.bid_price || 0), 0);
+    const totalValue = autoSelectedWithAlloc.reduce((sum, lot) => sum + (lot.bid_price || 0), 0);
 
     res.json({
       success: true,
       data: {
         sales_config: salesConfig,
-        available_lots: availableLots,
-        auto_selected: autoSelected,
+        available_lots: lotsWithAlloc,
+        auto_selected: autoSelectedWithAlloc,
         selection_limits: {
           requested: requested_qty,
+          required_bales: base,
           max_allowed: maxLimit,
-          auto_selected_count: autoSelected.length
+          auto_selected_count: autoSelectedWithAlloc.length
         },
         total_value: totalValue,
-        out_of_stock: false
+        out_of_stock: false,
+        priority_branch_used: false
       }
     });
   })

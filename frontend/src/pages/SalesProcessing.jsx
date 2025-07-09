@@ -1,6 +1,7 @@
 /**
  * Sales Processing page - Flow 5 & 6
  * Handle sales order processing, lot allocation, and confirmations
+ * Production-ready implementation for cotton trading automation
  */
 
 import React, { useState, useEffect } from 'react'
@@ -14,7 +15,12 @@ import {
   CheckCircle,
   AlertTriangle,
   FileText,
-  Clock
+  Clock,
+  Calculator,
+  MapPin,
+  Package,
+  DollarSign,
+  Info
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { supabase } from '../services/supabaseClient'
@@ -30,6 +36,15 @@ const SalesProcessing = () => {
   const [loading, setLoading] = useState(true)
   const [processingSales, setProcessingSales] = useState(false)
   const [mode, setMode] = useState('list') // 'list', 'processing', 'selection', 'confirm'
+  const [selectionStats, setSelectionStats] = useState({
+    requiredBales: 0,
+    selectedBales: 0,
+    totalValue: 0,
+    brokerCommission: 0,
+    netAmount: 0,
+    insufficientLots: false,
+    warningMessage: ''
+  })
 
   // New Order state
   const [showNewOrderForm, setShowNewOrderForm] = useState(false)
@@ -43,9 +58,10 @@ const SalesProcessing = () => {
   })
   const [creatingOrder, setCreatingOrder] = useState(false)
 
-  // Fetch options for customer and broker dropdowns (optional, can be improved)
+  // Fetch options for customer and broker dropdowns
   const [customerOptions, setCustomerOptions] = useState([])
   const [brokerOptions, setBrokerOptions] = useState([])
+
   useEffect(() => {
     // Fetch customers
     api.get('/customer-info')
@@ -61,6 +77,7 @@ const SalesProcessing = () => {
   const handleNewOrderChange = (field, value) => {
     setNewOrder(prev => ({ ...prev, [field]: value }))
   }
+  
   const handleLineItemChange = (idx, field, value) => {
     setNewOrder(prev => {
       const items = [...prev.line_items]
@@ -68,9 +85,11 @@ const SalesProcessing = () => {
       return { ...prev, line_items: items }
     })
   }
+  
   const addLineItem = () => {
     setNewOrder(prev => ({ ...prev, line_items: [...prev.line_items, { indent_number: '', quantity: '', commission_rate: '' }] }))
   }
+  
   const removeLineItem = (idx) => {
     setNewOrder(prev => ({ ...prev, line_items: prev.line_items.filter((_, i) => i !== idx) }))
   }
@@ -80,12 +99,23 @@ const SalesProcessing = () => {
     e.preventDefault()
     setCreatingOrder(true)
     try {
-      // Validate fields (basic)
+      // Enhanced validation
       if (!newOrder.customer_id || !newOrder.broker_id || !newOrder.requested_quantity || !newOrder.lifting_period || newOrder.line_items.length === 0) {
         toast.error('Please fill all required fields and add at least one line item')
         setCreatingOrder(false)
         return
       }
+
+      // Validate line items
+      const invalidLineItems = newOrder.line_items.filter(item => 
+        !item.indent_number || !item.quantity || !item.commission_rate
+      )
+      if (invalidLineItems.length > 0) {
+        toast.error('Please fill all fields in line items')
+        setCreatingOrder(false)
+        return
+      }
+
       // POST to backend
       await api.post('/sales/new', {
         ...newOrder,
@@ -96,7 +126,8 @@ const SalesProcessing = () => {
           commission_rate: Number(item.commission_rate)
         }))
       })
-      toast.success('Sales order created!')
+      
+      toast.success('Sales order created successfully!')
       setShowNewOrderForm(false)
       setNewOrder({
         customer_id: '', broker_id: '', requested_quantity: '', lifting_period: '', priority_branch: '',
@@ -104,7 +135,9 @@ const SalesProcessing = () => {
       })
       fetchPendingOrders()
     } catch (error) {
-      toast.error(error.response?.data?.message || 'Failed to create order')
+      console.error('Error creating order:', error)
+      const message = error.response?.data?.message || 'Failed to create order'
+      toast.error(message)
     } finally {
       setCreatingOrder(false)
     }
@@ -118,7 +151,6 @@ const SalesProcessing = () => {
       setPendingOrders(response.data.data.orders)
     } catch (error) {
       console.error('Error fetching pending orders:', error)
-      // Only show toast for non-401 errors, as 401 is handled by global interceptor
       if (error.response?.status !== 401) {
         toast.error('Failed to fetch pending orders')
       }
@@ -137,7 +169,6 @@ const SalesProcessing = () => {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'sales_configuration' },
         (payload) => {
-          // Only refresh if status is not 'completed' (pending/processing)
           fetchPendingOrders()
         }
       )
@@ -148,16 +179,27 @@ const SalesProcessing = () => {
     }
   }, [])
 
+  // Enhanced lot selection calculation
+  const calculateRequiredLots = (requestedQty) => {
+    // Convert to bales: 1 ton = 6.12 bales (industry standard)
+    const balesPerTon = 6.12
+    const requiredBales = Math.ceil(requestedQty * balesPerTon)
+    return requiredBales
+  }
+
   // Select order for processing
   const selectOrder = async (order) => {
     try {
       setSelectedOrder(order)
       setMode('processing')
       
-      // Auto-select lots
+      // Calculate required lots based on industry standard
+      const requiredBales = calculateRequiredLots(order.requested_quantity)
+      
+      // Auto-select lots with enhanced logic
       const response = await api.post('/sales/auto-select-lots', {
         sales_config_id: order.id,
-        requested_qty: order.requested_quantity
+        requested_qty: requiredBales
       })
       
       if (response.data.data.out_of_stock) {
@@ -169,29 +211,74 @@ const SalesProcessing = () => {
       setAvailableLots(response.data.data.available_lots)
       setAutoSelectedLots(response.data.data.auto_selected)
       setManualSelection(response.data.data.auto_selected.map(lot => lot.id))
+      
+      // Calculate initial stats
+      updateSelectionStats(response.data.data.auto_selected, requiredBales, order)
+      
       setMode('selection')
     } catch (error) {
       console.error('Error selecting order:', error)
-      toast.error(error.response?.data?.message || 'Failed to process order')
+      const message = error.response?.data?.message || 'Failed to process order'
+      toast.error(message)
       setMode('list')
     }
   }
 
+  // Update selection statistics
+  const updateSelectionStats = (selectedLots, requiredBales, order) => {
+    const totalValue = selectedLots.reduce((sum, lot) => sum + (lot.bid_price || 0), 0)
+    const brokerCommission = (totalValue * (order.broker_info?.commission_rate || 0)) / 100
+    const netAmount = totalValue - brokerCommission
+    const insufficientLots = selectedLots.length < requiredBales
+    
+    let warningMessage = ''
+    if (insufficientLots) {
+      warningMessage = `Insufficient lots. Required: ${requiredBales}, Selected: ${selectedLots.length}`
+    } else if (selectedLots.length > requiredBales * 1.2) {
+      warningMessage = `Over-selected lots. Required: ${requiredBales}, Selected: ${selectedLots.length}`
+    }
+
+    setSelectionStats({
+      requiredBales,
+      selectedBales: selectedLots.length,
+      totalValue,
+      brokerCommission,
+      netAmount,
+      insufficientLots,
+      warningMessage
+    })
+  }
+
   // Toggle manual lot selection
   const toggleLotSelection = (lotId) => {
-    setManualSelection(prev => 
-      prev.includes(lotId) 
+    setManualSelection(prev => {
+      const newSelection = prev.includes(lotId) 
         ? prev.filter(id => id !== lotId)
         : [...prev, lotId]
-    )
+      
+      // Update stats when selection changes
+      const selectedLots = availableLots.filter(lot => newSelection.includes(lot.id))
+      const requiredBales = calculateRequiredLots(selectedOrder.requested_quantity)
+      updateSelectionStats(selectedLots, requiredBales, selectedOrder)
+      
+      return newSelection
+    })
   }
 
   // Validate selection and proceed
   const validateAndProceed = () => {
-    if (manualSelection.length < selectedOrder.requested_quantity) {
-      toast.error(`Please select at least ${selectedOrder.requested_quantity} lots`)
+    const requiredBales = calculateRequiredLots(selectedOrder.requested_quantity)
+    
+    if (manualSelection.length < requiredBales) {
+      toast.error(`Please select at least ${requiredBales} lots (${selectedOrder.requested_quantity} tons × 6.12 bales/ton)`)
       return
     }
+    
+    if (selectionStats.insufficientLots) {
+      toast.error('Insufficient lots selected. Please add more lots or contact inventory management.')
+      return
+    }
+    
     setMode('confirm')
   }
 
@@ -203,7 +290,7 @@ const SalesProcessing = () => {
       await api.post('/sales/save-draft', {
         sales_config_id: selectedOrder.id,
         selected_lots: manualSelection,
-        notes: 'Draft saved from sales processing'
+        notes: `Draft saved by ${user.first_name} ${user.last_name} on ${new Date().toLocaleString()}`
       })
       
       toast.success('Sales draft saved successfully')
@@ -211,7 +298,8 @@ const SalesProcessing = () => {
       fetchPendingOrders()
     } catch (error) {
       console.error('Error saving draft:', error)
-      toast.error(error.response?.data?.message || 'Failed to save draft')
+      const message = error.response?.data?.message || 'Failed to save draft'
+      toast.error(message)
     } finally {
       setProcessingSales(false)
     }
@@ -225,15 +313,16 @@ const SalesProcessing = () => {
       await api.post('/sales/confirm', {
         sales_config_id: selectedOrder.id,
         selected_lots: manualSelection,
-        notes: 'Sale confirmed from sales processing'
+        notes: `Sale confirmed by ${user.first_name} ${user.last_name} on ${new Date().toLocaleString()}`
       })
       
-      toast.success('Sales order confirmed successfully!')
+      toast.success('Sales order confirmed successfully! n8n automation triggered.')
       setMode('list')
       fetchPendingOrders()
     } catch (error) {
       console.error('Error confirming sale:', error)
-      toast.error(error.response?.data?.message || 'Failed to confirm sale')
+      const message = error.response?.data?.message || 'Failed to confirm sale'
+      toast.error(message)
     } finally {
       setProcessingSales(false)
     }
@@ -245,6 +334,15 @@ const SalesProcessing = () => {
     setAvailableLots([])
     setAutoSelectedLots([])
     setManualSelection([])
+    setSelectionStats({
+      requiredBales: 0,
+      selectedBales: 0,
+      totalValue: 0,
+      brokerCommission: 0,
+      netAmount: 0,
+      insufficientLots: false,
+      warningMessage: ''
+    })
     setMode('list')
   }
 
@@ -300,15 +398,19 @@ const SalesProcessing = () => {
                   </select>
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-gray-700">Requested Quantity (bales)</label>
+                  <label className="block text-sm font-medium text-gray-700">Requested Quantity (tons)</label>
                   <input
                     type="number"
                     className="input-field"
                     value={newOrder.requested_quantity}
                     onChange={e => handleNewOrderChange('requested_quantity', e.target.value)}
                     min={1}
+                    step={0.01}
                     required
                   />
+                  <p className="text-xs text-gray-500 mt-1">
+                    Will require ~{newOrder.requested_quantity ? Math.ceil(newOrder.requested_quantity * 6.12) : 0} bales
+                  </p>
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700">Lifting Period</label>
@@ -317,6 +419,7 @@ const SalesProcessing = () => {
                     className="input-field"
                     value={newOrder.lifting_period}
                     onChange={e => handleNewOrderChange('lifting_period', e.target.value)}
+                    placeholder="e.g., Dec 2024 - Jan 2025"
                     required
                   />
                 </div>
@@ -327,6 +430,7 @@ const SalesProcessing = () => {
                     className="input-field"
                     value={newOrder.priority_branch}
                     onChange={e => handleNewOrderChange('priority_branch', e.target.value)}
+                    placeholder="Optional: Preferred branch"
                   />
                 </div>
               </div>
@@ -346,8 +450,9 @@ const SalesProcessing = () => {
                     <input
                       type="number"
                       className="input-field"
-                      placeholder="Quantity"
-                      min={1}
+                      placeholder="Quantity (tons)"
+                      min={0.01}
+                      step={0.01}
                       value={item.quantity}
                       onChange={e => handleLineItemChange(idx, 'quantity', e.target.value)}
                       required
@@ -357,6 +462,8 @@ const SalesProcessing = () => {
                       className="input-field"
                       placeholder="Commission Rate (%)"
                       min={0}
+                      max={100}
+                      step={0.01}
                       value={item.commission_rate}
                       onChange={e => handleLineItemChange(idx, 'commission_rate', e.target.value)}
                       required
@@ -377,9 +484,9 @@ const SalesProcessing = () => {
 
         {/* Header */}
         <div className="border-b border-gray-200 pb-4">
-          <h1 className="text-2xl font-bold text-gray-900">Sales Processing</h1>
+          <h1 className="text-2xl font-bold text-gray-900">Sales Processing - Flow 6</h1>
           <p className="mt-1 text-sm text-gray-600">
-            Process pending sales orders and allocate inventory lots
+            Process pending sales orders and allocate inventory lots for confirmed contracts
           </p>
         </div>
 
@@ -401,7 +508,7 @@ const SalesProcessing = () => {
               <div className="ml-3">
                 <p className="text-sm font-medium text-gray-500">Total Requested</p>
                 <p className="text-lg font-semibold text-gray-900">
-                  {pendingOrders.reduce((sum, order) => sum + order.requested_quantity, 0)}
+                  {pendingOrders.reduce((sum, order) => sum + order.requested_quantity, 0).toFixed(2)} tons
                 </p>
               </div>
             </div>
@@ -448,6 +555,7 @@ const SalesProcessing = () => {
                         <h4 className="font-medium text-gray-900">Customer</h4>
                         <p className="text-sm text-gray-600">{order.customer_info?.customer_name}</p>
                         <p className="text-xs text-gray-500">{order.customer_info?.customer_code}</p>
+                        <p className="text-xs text-gray-500">{order.customer_info?.state}</p>
                       </div>
                       
                       <div>
@@ -458,11 +566,18 @@ const SalesProcessing = () => {
                       
                       <div>
                         <h4 className="font-medium text-gray-900">Requirements</h4>
-                        <p className="text-sm text-gray-600">Quantity: {order.requested_quantity} bales</p>
+                        <p className="text-sm text-gray-600">
+                          {order.requested_quantity} tons (~{Math.ceil(order.requested_quantity * 6.12)} bales)
+                        </p>
                         <p className="text-xs text-gray-500">Period: {order.lifting_period}</p>
                         {order.line_specs && (
                           <p className="text-xs text-gray-500">
                             Specs: {order.line_specs.variety || 'Any'} • {order.line_specs.fibre_length || 'Any'}
+                          </p>
+                        )}
+                        {order.priority_branch && (
+                          <p className="text-xs text-blue-600">
+                            Priority: {order.priority_branch}
                           </p>
                         )}
                       </div>
@@ -509,6 +624,7 @@ const SalesProcessing = () => {
         <div className="text-center">
           <LoadingSpinner size="lg" />
           <p className="mt-4 text-gray-600">Processing sales order...</p>
+          <p className="text-sm text-gray-500">Calculating required lots and fetching inventory</p>
         </div>
       </div>
     )
@@ -517,7 +633,6 @@ const SalesProcessing = () => {
   // Selection View
   if (mode === 'selection') {
     const selectedLots = availableLots.filter(lot => manualSelection.includes(lot.id))
-    const totalValue = selectedLots.reduce((sum, lot) => sum + (lot.bid_price || 0), 0)
 
     return (
       <div className="space-y-6">
@@ -546,10 +661,13 @@ const SalesProcessing = () => {
             <div>
               <span className="font-medium text-gray-500">Customer:</span>
               <p className="text-gray-900">{selectedOrder.customer_info?.customer_name}</p>
+              <p className="text-xs text-gray-500">{selectedOrder.customer_info?.state}</p>
             </div>
             <div>
               <span className="font-medium text-gray-500">Requested Quantity:</span>
-              <p className="text-gray-900">{selectedOrder.requested_quantity} bales</p>
+              <p className="text-gray-900">
+                {selectedOrder.requested_quantity} tons (~{selectionStats.requiredBales} bales)
+              </p>
             </div>
             <div>
               <span className="font-medium text-gray-500">Priority Branch:</span>
@@ -563,34 +681,66 @@ const SalesProcessing = () => {
         </div>
 
         {/* Selection Summary */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-blue-50 p-4 rounded-lg text-center">
-            <p className="text-sm font-medium text-blue-600">Required</p>
-            <p className="text-2xl font-bold text-blue-900">{selectedOrder.requested_quantity}</p>
+            <p className="text-sm font-medium text-blue-600">Required Bales</p>
+            <p className="text-2xl font-bold text-blue-900">{selectionStats.requiredBales}</p>
+            <p className="text-xs text-blue-600">({selectedOrder.requested_quantity} tons × 6.12)</p>
           </div>
           <div className="bg-green-50 p-4 rounded-lg text-center">
-            <p className="text-sm font-medium text-green-600">Selected</p>
-            <p className="text-2xl font-bold text-green-900">{manualSelection.length}</p>
+            <p className="text-sm font-medium text-green-600">Selected Bales</p>
+            <p className="text-2xl font-bold text-green-900">{selectionStats.selectedBales}</p>
           </div>
           <div className="bg-purple-50 p-4 rounded-lg text-center">
             <p className="text-sm font-medium text-purple-600">Total Value</p>
-            <p className="text-2xl font-bold text-purple-900">₹{totalValue.toLocaleString()}</p>
+            <p className="text-2xl font-bold text-purple-900">₹{selectionStats.totalValue.toLocaleString()}</p>
+          </div>
+          <div className="bg-orange-50 p-4 rounded-lg text-center">
+            <p className="text-sm font-medium text-orange-600">Net Amount</p>
+            <p className="text-2xl font-bold text-orange-900">₹{selectionStats.netAmount.toLocaleString()}</p>
+            <p className="text-xs text-orange-600">After {selectedOrder.broker_info?.commission_rate}% commission</p>
           </div>
         </div>
+
+        {/* Warning Message */}
+        {selectionStats.warningMessage && (
+          <div className={`p-4 rounded-lg ${
+            selectionStats.insufficientLots ? 'bg-red-50 border border-red-200' : 'bg-yellow-50 border border-yellow-200'
+          }`}>
+            <div className="flex items-center">
+              <AlertTriangle className={`h-5 w-5 ${
+                selectionStats.insufficientLots ? 'text-red-400' : 'text-yellow-400'
+              }`} />
+              <p className={`ml-2 text-sm ${
+                selectionStats.insufficientLots ? 'text-red-700' : 'text-yellow-700'
+              }`}>
+                {selectionStats.warningMessage}
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* Available Lots */}
         <div className="card p-6">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-medium text-gray-900">Available Lots</h3>
+            <h3 className="text-lg font-medium text-gray-900">
+              Available Lots ({availableLots.length})
+            </h3>
             <div className="flex space-x-2">
               <button
-                onClick={() => setManualSelection(autoSelectedLots.map(lot => lot.id))}
+                onClick={() => {
+                  setManualSelection(autoSelectedLots.map(lot => lot.id))
+                  updateSelectionStats(autoSelectedLots, selectionStats.requiredBales, selectedOrder)
+                }}
                 className="btn-secondary text-sm"
               >
                 Reset to Auto-Selection
               </button>
               <button
-                onClick={() => setManualSelection(availableLots.map(lot => lot.id))}
+                onClick={() => {
+                  setManualSelection(availableLots.map(lot => lot.id))
+                  updateSelectionStats(availableLots, selectionStats.requiredBales, selectedOrder)
+                }}
                 className="btn-secondary text-sm"
               >
                 Select All
@@ -612,10 +762,13 @@ const SalesProcessing = () => {
                     Specifications
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                    Branch
+                    Location
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
                     Price
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
+                    Status
                   </th>
                 </tr>
               </thead>
@@ -634,18 +787,33 @@ const SalesProcessing = () => {
                       <div>
                         <div className="text-sm font-medium text-gray-900">{lot.lot_number}</div>
                         <div className="text-sm text-gray-500">{lot.indent_number}</div>
+                        <div className="text-xs text-gray-400">Added: {new Date(lot.created_at).toLocaleDateString()}</div>
                       </div>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <div className="text-sm text-gray-900">{lot.variety}</div>
                       <div className="text-sm text-gray-500">{lot.fibre_length}</div>
+                      <div className="text-xs text-gray-400">{lot.lifting_period}</div>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <div className="text-sm text-gray-900">{lot.branch}</div>
                       <div className="text-sm text-gray-500">{lot.centre_name}</div>
+                      {lot.branch_information && (
+                        <div className="text-xs text-gray-400">{lot.branch_information.zone}</div>
+                      )}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <div className="text-sm font-medium text-gray-900">₹{lot.bid_price}</div>
+                      <div className="text-sm font-medium text-gray-900">₹{lot.bid_price?.toLocaleString()}</div>
+                      <div className="text-xs text-gray-500">per bale</div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                        lot.status === 'AVAILABLE' ? 'bg-green-100 text-green-800' :
+                        lot.status === 'BLOCKED' ? 'bg-yellow-100 text-yellow-800' :
+                        'bg-gray-100 text-gray-800'
+                      }`}>
+                        {lot.status}
+                      </span>
                     </td>
                   </tr>
                 ))}
@@ -656,11 +824,11 @@ const SalesProcessing = () => {
           <div className="mt-6 flex justify-end">
             <button
               onClick={validateAndProceed}
-              disabled={manualSelection.length < selectedOrder.requested_quantity}
-              className="btn-primary"
+              disabled={selectionStats.insufficientLots}
+              className={`btn-primary ${selectionStats.insufficientLots ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               Proceed to Confirmation
-              ({manualSelection.length} selected)
+              ({selectionStats.selectedBales} selected)
             </button>
           </div>
         </div>
@@ -671,8 +839,6 @@ const SalesProcessing = () => {
   // Confirmation View
   if (mode === 'confirm') {
     const selectedLots = availableLots.filter(lot => manualSelection.includes(lot.id))
-    const totalValue = selectedLots.reduce((sum, lot) => sum + (lot.bid_price || 0), 0)
-    const brokerCommission = (totalValue * (selectedOrder.broker_info?.commission_rate || 0)) / 100
 
     return (
       <div className="space-y-6">
@@ -696,12 +862,20 @@ const SalesProcessing = () => {
                   <span className="text-gray-900">{selectedOrder.customer_info?.customer_name}</span>
                 </div>
                 <div className="flex justify-between">
+                  <span className="text-gray-500">State:</span>
+                  <span className="text-gray-900">{selectedOrder.customer_info?.state}</span>
+                </div>
+                <div className="flex justify-between">
                   <span className="text-gray-500">Broker:</span>
                   <span className="text-gray-900">{selectedOrder.broker_info?.broker_name}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-500">Commission Rate:</span>
                   <span className="text-gray-900">{selectedOrder.broker_info?.commission_rate}%</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Lifting Period:</span>
+                  <span className="text-gray-900">{selectedOrder.lifting_period}</span>
                 </div>
               </div>
             </div>
@@ -710,20 +884,28 @@ const SalesProcessing = () => {
               <h4 className="font-medium text-gray-900 mb-3">Financial Summary</h4>
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
-                  <span className="text-gray-500">Total Lots:</span>
-                  <span className="text-gray-900">{selectedLots.length}</span>
+                  <span className="text-gray-500">Requested Quantity:</span>
+                  <span className="text-gray-900">{selectedOrder.requested_quantity} tons</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Required Bales:</span>
+                  <span className="text-gray-900">{selectionStats.requiredBales} bales</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500">Selected Bales:</span>
+                  <span className="text-gray-900">{selectionStats.selectedBales} bales</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-500">Total Value:</span>
-                  <span className="text-gray-900">₹{totalValue.toLocaleString()}</span>
+                  <span className="text-gray-900">₹{selectionStats.totalValue.toLocaleString()}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-500">Broker Commission:</span>
-                  <span className="text-gray-900">₹{brokerCommission.toLocaleString()}</span>
+                  <span className="text-gray-900">₹{selectionStats.brokerCommission.toLocaleString()}</span>
                 </div>
-                <div className="flex justify-between font-medium">
+                <div className="flex justify-between font-medium border-t pt-2">
                   <span className="text-gray-900">Net Amount:</span>
-                  <span className="text-gray-900">₹{(totalValue - brokerCommission).toLocaleString()}</span>
+                  <span className="text-gray-900">₹{selectionStats.netAmount.toLocaleString()}</span>
                 </div>
               </div>
             </div>
@@ -732,7 +914,9 @@ const SalesProcessing = () => {
 
         {/* Selected Lots Preview */}
         <div className="card p-6">
-          <h3 className="text-lg font-medium text-gray-900 mb-4">Selected Lots ({selectedLots.length})</h3>
+          <h3 className="text-lg font-medium text-gray-900 mb-4">
+            Selected Lots ({selectedLots.length})
+          </h3>
           <div className="max-h-64 overflow-y-auto">
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {selectedLots.map((lot) => (
@@ -740,7 +924,8 @@ const SalesProcessing = () => {
                   <div className="font-medium text-gray-900">{lot.lot_number}</div>
                   <div className="text-gray-600">{lot.indent_number}</div>
                   <div className="text-gray-600">{lot.variety} • {lot.fibre_length}</div>
-                  <div className="text-gray-900 font-medium">₹{lot.bid_price}</div>
+                  <div className="text-gray-600">{lot.branch} • {lot.centre_name}</div>
+                  <div className="text-gray-900 font-medium">₹{lot.bid_price?.toLocaleString()}</div>
                 </div>
               ))}
             </div>
