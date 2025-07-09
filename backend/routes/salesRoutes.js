@@ -139,7 +139,7 @@ router.post('/auto-select-lots',
     }
 
         // Calculate selection limits based on industry standard (6.12 bales per ton)
-    const balesPerTon = 6.12;
+    const balesPerTon = 1; // CHANGED FROM 6.12 to 1 for testing
     const base = Math.ceil(requested_qty * balesPerTon);
     const extra = Math.floor(base * 0.2); // 20% extra for flexibility
     const maxLimit = base + extra;
@@ -635,12 +635,90 @@ async function createOrUpdateSalesDraft(sales_config_id, selected_lots, user_id)
 
     // If a draft exists, update it; otherwise create new
     if (existingDraft) {
-      // Update existing draft logic here
+      // Update existing draft logic here (optional: update lots, etc.)
       return { success: true, data: existingDraft };
     } else {
-      // Create new draft logic here (similar to save-draft route)
-      // ... implementation similar to save-draft
-      return { success: true, data: { id: 'new-draft-id' } };
+      // --- Begin: Create new draft logic (copied from /save-draft route) ---
+      // Fetch sales configuration
+      const { data: salesConfig, error: configError } = await supabase
+        .from('sales_configuration')
+        .select(`*, customer_info:customer_id (*), broker_info:broker_id (*)`)
+        .eq('id', sales_config_id)
+        .single();
+      if (configError || !salesConfig) {
+        return { success: false, message: 'Sales configuration not found' };
+      }
+      // Fetch selected lots
+      const { data: lots, error: lotsError } = await supabase
+        .from('inventory_table')
+        .select('*')
+        .in('id', selected_lots);
+      if (lotsError) {
+        return { success: false, message: 'Failed to fetch selected lots', error: lotsError.message };
+      }
+      // Calculate totals
+      const totalBales = lots.length;
+      const totalValue = lots.reduce((sum, lot) => sum + (lot.bid_price || 0), 0);
+      const brokerCommission = (totalValue * (salesConfig.broker_info.commission_rate || 0)) / 100;
+      // Create sales record
+      const salesData = {
+        sales_config_id,
+        indent_numbers: [...new Set(lots.map(lot => lot.indent_number))],
+        total_bales: totalBales,
+        total_value: totalValue,
+        broker_commission: brokerCommission,
+        status: 'DRAFT',
+        created_by: user_id
+      };
+      const { data: salesRecord, error: salesError } = await supabase
+        .from('sales_table')
+        .insert(salesData)
+        .select()
+        .single();
+      if (salesError) {
+        return { success: false, message: `Failed to create sales record: ${salesError.message}` };
+      }
+      // Create lot selections
+      const lotSelections = lots.map(lot => ({
+        sales_id: salesRecord.id,
+        inventory_id: lot.id,
+        lot_number: lot.lot_number,
+        indent_number: lot.indent_number,
+        quantity: 1, // Assuming 1 bale per lot
+        price: lot.bid_price || 0,
+        status: 'SELECTED'
+      }));
+      const { error: selectionsError } = await supabase
+        .from('lot_selected_contract')
+        .insert(lotSelections);
+      if (selectionsError) {
+        return { success: false, message: `Failed to save lot selections: ${selectionsError.message}` };
+      }
+      // Block the selected lots
+      const { error: blockError } = await supabase
+        .from('inventory_table')
+        .update({ status: 'BLOCKED', updated_at: new Date().toISOString() })
+        .in('id', selected_lots);
+      if (blockError) {
+        return { success: false, message: `Failed to block lots: ${blockError.message}` };
+      }
+      // Update sales configuration status
+      await supabase
+        .from('sales_configuration')
+        .update({ status: 'processing', updated_at: new Date().toISOString() })
+        .eq('id', sales_config_id);
+      // Log the draft creation
+      await supabase
+        .from('audit_log')
+        .insert({
+          table_name: 'sales_table',
+          record_id: salesRecord.id,
+          action: 'SALES_DRAFT_CREATED',
+          user_id: user_id,
+          new_values: { ...salesData, lots_count: totalBales }
+        });
+      // --- End: Create new draft logic ---
+      return { success: true, data: salesRecord };
     }
   } catch (error) {
     return { success: false, message: error.message };
