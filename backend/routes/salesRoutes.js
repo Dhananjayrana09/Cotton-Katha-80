@@ -583,7 +583,12 @@ router.post('/confirm',
 
       // Trigger n8n webhook for confirmation
       try {
-        const confirmWebhookUrl = `${process.env.N8N_BASE_URL}${process.env.N8N_SALES_CONFIRMATION_WEBHOOK}`;
+        let confirmWebhookUrl;
+        if (process.env.N8N_SALES_CONFIRMATION_WEBHOOK?.startsWith('http')) {
+          confirmWebhookUrl = process.env.N8N_SALES_CONFIRMATION_WEBHOOK;
+        } else {
+          confirmWebhookUrl = `${process.env.N8N_BASE_URL}${process.env.N8N_SALES_CONFIRMATION_WEBHOOK}`;
+        }
         await axios.post(confirmWebhookUrl, {
           sales_id: salesRecord.id,
           customer: completeData.sales_configuration.customer_info,
