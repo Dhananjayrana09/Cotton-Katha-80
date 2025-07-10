@@ -568,18 +568,76 @@ router.post('/confirm',
           new_values: { status: 'CONFIRMED', notes }
         });
 
-      // Fetch complete data for webhook
+      // Fetch complete data for webhook including lot details
       const { data: completeData } = await supabase
         .from('sales_table')
         .select(`
           *,
           sales_configuration:sales_config_id (
             customer_info:customer_id (*),
-            broker_info:broker_id (*)
+            broker_info:broker_id (*),
+            requested_quantity,
+            lifting_period,
+            priority_branch,
+            line_specs
+          ),
+          lot_selected_contract (
+            *,
+            inventory_table:inventory_id (
+              *,
+              branch_information:branch_id (
+                branch_name,
+                zone
+              )
+            )
           )
         `)
         .eq('id', salesRecord.id)
         .single();
+
+      // Fetch allocation details for all indent numbers
+      const indentNumbers = completeData.indent_numbers || [];
+      let allocationDetailsMap = {};
+      if (indentNumbers.length > 0) {
+        const { data: allocations, error: allocationError } = await supabase
+          .from('allocation')
+          .select('*')
+          .in('indent_number', indentNumbers);
+        if (!allocationError && allocations) {
+          allocationDetailsMap = allocations.reduce((acc, alloc) => {
+            acc[alloc.indent_number] = alloc;
+            return acc;
+          }, {});
+        }
+      }
+
+      // Prepare lot details with allocation information
+      const lotDetails = completeData.lot_selected_contract?.map(lotSelection => {
+        const inventory = lotSelection.inventory_table;
+        const allocation = allocationDetailsMap[inventory?.indent_number] || null;
+        
+        return {
+          lot_number: inventory?.lot_number,
+          indent_number: inventory?.indent_number,
+          centre_name: inventory?.centre_name,
+          branch: inventory?.branch,
+          branch_zone: inventory?.branch_information?.zone,
+          date: inventory?.date,
+          lifting_period: inventory?.lifting_period,
+          fibre_length: inventory?.fibre_length,
+          variety: inventory?.variety,
+          bid_price: inventory?.bid_price,
+          quantity: lotSelection.quantity,
+          price: lotSelection.price,
+          status: lotSelection.status,
+          allocation_details: allocation ? {
+            crop_year: allocation.crop_year,
+            buyer_type: allocation.buyer_type,
+            otr_price: allocation.otr_price,
+            allocation_status: allocation.allocation_status
+          } : null
+        };
+      }) || [];
 
       // Trigger n8n webhook for confirmation
       try {
@@ -593,9 +651,17 @@ router.post('/confirm',
           sales_id: salesRecord.id,
           customer: completeData.sales_configuration.customer_info,
           broker: completeData.sales_configuration.broker_info,
+          sales_configuration: {
+            requested_quantity: completeData.sales_configuration.requested_quantity,
+            lifting_period: completeData.sales_configuration.lifting_period,
+            priority_branch: completeData.sales_configuration.priority_branch,
+            line_specs: completeData.sales_configuration.line_specs
+          },
           total_bales: confirmedSales.total_bales,
           total_value: confirmedSales.total_value,
           broker_commission: confirmedSales.broker_commission,
+          indent_numbers: completeData.indent_numbers,
+          lot_details: lotDetails,
           confirmed_by: req.user,
           confirmed_at: confirmedSales.confirmed_at,
           notes
