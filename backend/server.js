@@ -25,6 +25,7 @@ const salesRoutes = require('./routes/salesRoutes');
 const customerLotsRoutes = require('./routes/customerLotsRoutes');
 const n8nWebhookRoutes = require('./routes/n8nWebhookRoutes');
 const dashboardRoutes = require('./routes/dashboardRoutes');
+const doSpecificationsRoutes = require('./routes/doSpecificationsRoutes');
 
 // Import middleware
 const { errorHandler } = require('./middleware/errorHandler');
@@ -87,6 +88,7 @@ app.use('/api/sampling', samplingRoutes);
 app.use('/api/sales', salesRoutes);
 app.use('/api/customer', customerLotsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/do-specifications', doSpecificationsRoutes);
 app.use('/webhook/n8n', n8nWebhookRoutes);
 
 // GET /api/customer-info

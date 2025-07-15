@@ -40,6 +40,8 @@ const Layout = ({ children }) => {
         { name: 'Contracts', href: '/contract/search', icon: FileText, roles: ['admin', 'trader'] },
         { name: 'Sampling', href: '/sampling-entry', icon: Beaker, roles: ['admin', 'trader'] },
         { name: 'Sales', href: '/sales-processing', icon: ShoppingCart, roles: ['admin', 'trader'] },
+        { name: 'DO Specifications', href: '/do-specifications', icon: FileText, roles: ['admin', 'trader'] },
+        { name: 'DO Specifications History', href: '/do-specifications/history', icon: ClipboardList, roles: ['admin', 'trader'] },
       )
     }
 

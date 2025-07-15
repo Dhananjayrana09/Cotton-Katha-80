@@ -25,6 +25,8 @@ import AdminLotOverride from './pages/AdminLotOverride'
 import LoadingSpinner from './components/LoadingSpinner'
 import ManualAllocationEntry from './pages/ManualAllocationEntry'
 import LogsViewer from './pages/LogsViewer'
+import DOSpecifications from './pages/DOSpecifications';
+import DOSpecificationsHistory from './pages/DOSpecificationsHistory';
 
 function App() {
   const { user, loading } = useAuth()
@@ -72,6 +74,10 @@ function App() {
         {/* Customer Lots - Flow 7 */}
         <Route path="/customer/my-lots" element={<CustomerLots />} />
         <Route path="/admin/lot-override" element={<AdminLotOverride />} />
+
+        {/* DO Specifications */}
+        <Route path="/do-specifications" element={<DOSpecifications />} />
+        <Route path="/do-specifications/history" element={<DOSpecificationsHistory />} />
 
         {/* Logs Viewer */}
         <Route path="/logs" element={<LogsViewer />} />
