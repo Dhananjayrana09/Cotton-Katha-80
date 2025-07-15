@@ -22,7 +22,7 @@ import Skeleton from 'react-loading-skeleton'
 import 'react-loading-skeleton/dist/skeleton.css'
 import { Tooltip } from 'react-tooltip'
 
-const N8N_CONTRACT_APPROVE_SEND_WEBHOOK='https://primary-production-b52e.up.railway.app/webhook-test/contract-approve'; 
+const N8N_CONTRACT_APPROVE_SEND_WEBHOOK='https://webhook-processor-production-b54b.up.railway.app/webhook/contract-approve'; 
 
 const AdminContracts = () => {
   const { user, isAdmin } = useAuth()
