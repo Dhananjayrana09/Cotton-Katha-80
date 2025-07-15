@@ -23,7 +23,7 @@ import Skeleton from 'react-loading-skeleton';
 import 'react-loading-skeleton/dist/skeleton.css';
 import { Tooltip } from 'react-tooltip';
 
-const N8N_CONTRACT_UPLOAD_WEBHOOK='https://primary-production-b52e.up.railway.app/webhook-test/contract-upload';
+const N8N_CONTRACT_UPLOAD_WEBHOOK='https://webhook-processor-production-b54b.up.railway.app/webhook/contract-upload';
 
 const schema = yup.object().shape({
   contract: yup
