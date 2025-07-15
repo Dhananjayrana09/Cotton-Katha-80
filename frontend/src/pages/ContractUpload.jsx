@@ -84,7 +84,6 @@ const ContractUpload = () => {
   // Handle file input change
   const handleFileChange = (e) => {
     const selectedFile = e.target.files[0];
-    setValue('contract', selectedFile);
     handleFileSelect(selectedFile);
   };
 
@@ -110,8 +109,7 @@ const ContractUpload = () => {
   }
 
   // Upload contract
-  const uploadContract = async (data) => {
-    const file = data.contract;
+  const uploadContract = async () => {
     if (!file) {
       toast.error('Please select a PDF file');
       return;
@@ -289,7 +287,7 @@ const ContractUpload = () => {
         </div>
 
         {/* Drop Zone */}
-        <form onSubmit={handleSubmit(uploadContract)}>
+        <form onSubmit={e => { e.preventDefault(); uploadContract(); }}>
           <div
             className={`relative border-2 border-dashed rounded-lg p-6 transition-colors ${
               dragActive
@@ -315,7 +313,7 @@ const ContractUpload = () => {
                   </div>
                   <button
                     type="button"
-                    onClick={() => { setFile(null); setValue('contract', null); }}
+                    onClick={() => { setFile(null); }}
                     className="text-sm text-red-600 hover:text-red-800"
                   >
                     Remove file
@@ -337,7 +335,6 @@ const ContractUpload = () => {
                         className="sr-only"
                         accept=".pdf"
                         onChange={handleFileChange}
-                        {...register('contract')}
                       />
                     </label>
                     <span className="text-gray-500"> or drag and drop</span>
@@ -354,9 +351,6 @@ const ContractUpload = () => {
               )}
             </div>
           </div>
-          {errors.contract && (
-            <p className="mt-2 text-xs text-red-600 text-center">{errors.contract.message}</p>
-          )}
           {/* Upload Button */}
           <div className="mt-6 flex justify-end">
             <button
