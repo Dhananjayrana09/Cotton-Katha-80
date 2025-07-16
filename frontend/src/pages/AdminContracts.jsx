@@ -86,6 +86,15 @@ const AdminContracts = () => {
     try {
       setApproving(prev => ({ ...prev, [contractId]: true }))
       const contract = contracts.find(c => c.id === contractId)
+      // Fetch procurement info to get branch_email_id
+      let branchEmail = '';
+      try {
+        const procurementRes = await api.get('/contract/search', { params: { indent_number: contract.indent_number } });
+        branchEmail = procurementRes.data?.data?.procurement?.allocation?.branch_information?.branch_email_id || '';
+      } catch (e) {
+        // If procurement fetch fails, continue with empty branchEmail
+        console.error('Failed to fetch procurement for branch email', e);
+      }
       // Prepare payload for n8n webhook
       const payload = {
         contract_id: contractId,
@@ -93,6 +102,7 @@ const AdminContracts = () => {
         firm_name: contract.firm_name,
         file_url: contract.file_url,
         branch_name: contract.branch_name, // if available
+        branch_email_id: branchEmail,
         // Add more fields if needed by n8n
       }
       const response = await fetch(N8N_CONTRACT_APPROVE_SEND_WEBHOOK, {
