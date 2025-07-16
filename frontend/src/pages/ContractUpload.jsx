@@ -114,12 +114,16 @@ const ContractUpload = () => {
       toast.error('Please select a PDF file');
       return;
     }
+    // Extract branch email from procurement object
+    const branchEmail = procurement?.allocation?.branch_information?.branch_email_id || '';
     try {
       setUploading(true);
       const formData = new FormData();
       formData.append('contract', file);
       formData.append('indent_number', indentNumber);
       formData.append('firm_name', procurement.firm_name);
+      // Add branch email if available
+      formData.append('branch_email_id', branchEmail);
       const response = await fetch(N8N_CONTRACT_UPLOAD_WEBHOOK, {
         method: 'POST',
         body: formData
