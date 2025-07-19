@@ -153,6 +153,90 @@ router.get('/pending',
 );
 
 /**
+ * @route   GET /api/contract/indent-status
+ * @desc    Get all indent numbers with their contract upload status
+ * @access  Private
+ */
+router.get('/indent-status', 
+  authenticateToken,
+  asyncHandler(async (req, res) => {
+    // Get all procurement records
+    const { data: procurements, error: procurementError } = await supabase
+      .from('procurement_dump')
+      .select(`
+        indent_number,
+        firm_name,
+        bale_quantity,
+        total_amount,
+        created_at,
+        allocation:allocation_id (
+          branch_information:branch_id (
+            branch_name,
+            branch_code
+          )
+        )
+      `)
+      .order('created_at', { ascending: false });
+
+    if (procurementError) {
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to fetch procurement data',
+        error: procurementError.message
+      });
+    }
+
+    // Get all uploaded contracts
+    const { data: contracts, error: contractError } = await supabase
+      .from('purchase_contract_table')
+      .select('indent_number, status, uploaded_at, file_name')
+      .order('uploaded_at', { ascending: false });
+
+    if (contractError) {
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to fetch contract data',
+        error: contractError.message
+      });
+    }
+
+    // Create a map of indent numbers to contract status
+    const contractMap = {};
+    contracts.forEach(contract => {
+      contractMap[contract.indent_number] = {
+        status: contract.status,
+        uploaded_at: contract.uploaded_at,
+        file_name: contract.file_name
+      };
+    });
+
+    // Combine procurement data with contract status
+    const indentStatus = procurements.map(procurement => ({
+      indent_number: procurement.indent_number,
+      firm_name: procurement.firm_name,
+      bale_quantity: procurement.bale_quantity,
+      total_amount: procurement.total_amount,
+      created_at: procurement.created_at,
+      branch_name: procurement.allocation?.branch_information?.branch_name,
+      branch_code: procurement.allocation?.branch_information?.branch_code,
+      contract_status: contractMap[procurement.indent_number]?.status || 'pending',
+      contract_uploaded_at: contractMap[procurement.indent_number]?.uploaded_at || null,
+      contract_file_name: contractMap[procurement.indent_number]?.file_name || null
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        indent_status: indentStatus,
+        total_indents: indentStatus.length,
+        uploaded_contracts: contracts.length,
+        pending_contracts: indentStatus.filter(item => item.contract_status === 'pending').length
+      }
+    });
+  })
+);
+
+/**
  * @route   GET /api/contract/logs
  * @desc    Get contract logs (audit trail)
  * @access  Private (Admin only)
