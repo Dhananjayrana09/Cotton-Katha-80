@@ -6,34 +6,21 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const Joi = require('joi');
 const { supabase } = require('../config/supabase');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { validateBody } = require('../middleware/validation');
 const { authenticateToken } = require('../middleware/auth');
+const { sendErrorResponse, sendSuccessResponse } = require('../utils/databaseHelpers');
+const { routeSchemas } = require('../utils/validationSchemas');
 
 const router = express.Router();
-
-// Validation schemas
-const loginSchema = Joi.object({
-  email: Joi.string().email().required(),
-  password: Joi.string().required()
-});
-
-const registerSchema = Joi.object({
-  email: Joi.string().email().required(),
-  password: Joi.string().min(8).pattern(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/).required(),
-  first_name: Joi.string().min(2).max(50).required(),
-  last_name: Joi.string().min(2).max(50).required(),
-  role: Joi.string().valid('admin', 'trader', 'customer').default('trader')
-});
 
 /**
  * @route   POST /api/auth/login
  * @desc    Login user and return JWT token
  * @access  Public
  */
-router.post('/login', validateBody(loginSchema), asyncHandler(async (req, res) => {
+router.post('/login', validateBody(routeSchemas.auth.login), asyncHandler(async (req, res) => {
   const { email, password } = req.body;
 
   // Find user by email
@@ -44,26 +31,17 @@ router.post('/login', validateBody(loginSchema), asyncHandler(async (req, res) =
     .single();
 
   if (error || !user) {
-    return res.status(401).json({
-      success: false,
-      message: 'Invalid credentials'
-    });
+    return sendErrorResponse(res, 401, 'Invalid credentials');
   }
 
   if (!user.is_active) {
-    return res.status(401).json({
-      success: false,
-      message: 'Account is inactive'
-    });
+    return sendErrorResponse(res, 401, 'Account is inactive');
   }
 
   // Verify password
   const isValidPassword = await bcrypt.compare(password, user.password_hash);
   if (!isValidPassword) {
-    return res.status(401).json({
-      success: false,
-      message: 'Invalid credentials'
-    });
+    return sendErrorResponse(res, 401, 'Invalid credentials');
   }
 
   // Generate JWT token
@@ -73,7 +51,6 @@ router.post('/login', validateBody(loginSchema), asyncHandler(async (req, res) =
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   );
 
-  console.log("logged in nhi hua", user);
   // Log successful login
   await supabase
     .from('audit_log')
@@ -85,22 +62,16 @@ router.post('/login', validateBody(loginSchema), asyncHandler(async (req, res) =
       new_values: { login_time: new Date().toISOString() }
     });
 
-  console.log("logged in user", user);
-
-  res.json({
-    success: true,
-    message: 'Login successful',
-    data: {
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
-        first_name: user.first_name,
-        last_name: user.last_name,
-        role: user.role
-      }
+  return sendSuccessResponse(res, {
+    token,
+    user: {
+      id: user.id,
+      email: user.email,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      role: user.role
     }
-  });
+  }, 'Login successful');
 }));
 
 /**
@@ -108,7 +79,7 @@ router.post('/login', validateBody(loginSchema), asyncHandler(async (req, res) =
  * @desc    Register new user
  * @access  Public (or Admin only in production)
  */
-router.post('/register', validateBody(registerSchema), asyncHandler(async (req, res) => {
+router.post('/register', validateBody(routeSchemas.auth.register), asyncHandler(async (req, res) => {
   const { email, password, first_name, last_name, role } = req.body;
 
   // Check if user already exists
@@ -119,10 +90,7 @@ router.post('/register', validateBody(registerSchema), asyncHandler(async (req, 
     .single();
 
   if (existingUser) {
-    return res.status(400).json({
-      success: false,
-      message: 'User already exists with this email'
-    });
+    return sendErrorResponse(res, 400, 'User already exists with this email');
   }
 
   // Hash password
@@ -144,11 +112,7 @@ router.post('/register', validateBody(registerSchema), asyncHandler(async (req, 
     .single();
 
   if (error) {
-    return res.status(500).json({
-      success: false,
-      message: 'Failed to create user',
-      error: error.message
-    });
+    return sendErrorResponse(res, 500, 'Failed to create user', error.message);
   }
 
   // Generate JWT token
@@ -169,14 +133,10 @@ router.post('/register', validateBody(registerSchema), asyncHandler(async (req, 
       new_values: { registration_time: new Date().toISOString() }
     });
 
-  res.status(201).json({
-    success: true,
-    message: 'User registered successfully',
-    data: {
-      token,
-      user: newUser
-    }
-  });
+  return sendSuccessResponse(res, {
+    token,
+    user: newUser
+  }, 'User registered successfully', 201);
 }));
 
 /**
@@ -196,10 +156,7 @@ router.post('/logout', authenticateToken, asyncHandler(async (req, res) => {
       new_values: { logout_time: new Date().toISOString() }
     });
 
-  res.json({
-    success: true,
-    message: 'Logout successful'
-  });
+  return sendSuccessResponse(res, null, 'Logout successful');
 }));
 
 /**
@@ -208,12 +165,7 @@ router.post('/logout', authenticateToken, asyncHandler(async (req, res) => {
  * @access  Private
  */
 router.get('/me', authenticateToken, asyncHandler(async (req, res) => {
-  res.json({
-    success: true,
-    data: {
-      user: req.user
-    }
-  });
+  return sendSuccessResponse(res, { user: req.user });
 }));
 
 /**
@@ -236,20 +188,10 @@ router.put('/profile', authenticateToken, asyncHandler(async (req, res) => {
     .single();
 
   if (error) {
-    return res.status(500).json({
-      success: false,
-      message: 'Failed to update profile',
-      error: error.message
-    });
+    return sendErrorResponse(res, 500, 'Failed to update profile', error.message);
   }
 
-  res.json({
-    success: true,
-    message: 'Profile updated successfully',
-    data: {
-      user: updatedUser
-    }
-  });
+  return sendSuccessResponse(res, { user: updatedUser }, 'Profile updated successfully');
 }));
 
 module.exports = router;

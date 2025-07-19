@@ -13,6 +13,7 @@ const rateLimit = require('express-rate-limit');
 const { supabase } = require('./config/supabase');
 const { authenticateToken } = require('./middleware/auth');
 const { asyncHandler } = require('./middleware/errorHandler');
+const { sendErrorResponse, sendSuccessResponse } = require('./utils/databaseHelpers');
 
 // Import routes
 const authRoutes = require('./routes/authRoutes');
@@ -89,27 +90,34 @@ app.use('/api/customer', customerLotsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/do-specifications', doSpecificationsRoutes);
 
-// GET /api/customer-info
+// Common lookup endpoints using utility functions
 app.get('/api/customer-info', authenticateToken, asyncHandler(async (req, res) => {
   const { data, error } = await supabase
     .from('customer_info')
     .select('*')
     .order('customer_name', { ascending: true });
-  if (error) return res.status(500).json({ success: false, message: 'Failed to fetch customers', error: error.message });
-  res.json({ data: { customers: data } });
+    
+  if (error) {
+    return sendErrorResponse(res, 500, 'Failed to fetch customers', error.message);
+  }
+  
+  return sendSuccessResponse(res, { customers: data });
 }));
 
-// GET /api/broker-info
 app.get('/api/broker-info', authenticateToken, asyncHandler(async (req, res) => {
   const { data, error } = await supabase
     .from('broker_info')
     .select('*')
     .order('broker_name', { ascending: true });
-  if (error) return res.status(500).json({ success: false, message: 'Failed to fetch brokers', error: error.message });
-  res.json({ data: { brokers: data } });
+    
+  if (error) {
+    return sendErrorResponse(res, 500, 'Failed to fetch brokers', error.message);
+  }
+  
+  return sendSuccessResponse(res, { brokers: data });
 }));
 
-//backend health check
+// Backend health check
 app.get('/', (req, res) => {
   res.status(200).json({
     message: 'Hello World'
