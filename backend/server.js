@@ -26,6 +26,7 @@ const salesRoutes = require('./routes/salesRoutes');
 const customerLotsRoutes = require('./routes/customerLotsRoutes');
 const dashboardRoutes = require('./routes/dashboardRoutes');
 const doSpecificationsRoutes = require('./routes/doSpecificationsRoutes');
+const logsRoutes = require('./routes/logsRoutes');
 
 // Import middleware
 const { errorHandler } = require('./middleware/errorHandler');
@@ -89,6 +90,7 @@ app.use('/api/sales', salesRoutes);
 app.use('/api/customer', customerLotsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/do-specifications', doSpecificationsRoutes);
+app.use('/api/logs', logsRoutes);
 
 // Common lookup endpoints using utility functions
 app.get('/api/customer-info', authenticateToken, asyncHandler(async (req, res) => {

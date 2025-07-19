@@ -6,16 +6,24 @@
 const express = require('express');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
-const Joi = require('joi');
 const axios = require('axios');
 const { supabase } = require('../config/supabase');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { authenticateToken, authorizeRoles } = require('../middleware/auth');
 const { validateBody, validateQuery } = require('../middleware/validation');
+const { routeSchemas } = require('../utils/validationSchemas');
+const { sendErrorResponse, sendSuccessResponse, handleDatabaseError } = require('../utils/databaseHelpers');
+const {
+  searchProcurementByIndent,
+  getPendingContracts,
+  getIndentContractStatus,
+  approveContract,
+  getContractStatistics
+} = require('../utils/contractHelpers');
 
 const router = express.Router();
 
-// Configure multer for file uploads
+// Configure multer for file uploads (kept for potential future use)
 const storage = multer.memoryStorage();
 const upload = multer({
   storage: storage,
@@ -31,15 +39,6 @@ const upload = multer({
   }
 });
 
-// Validation schemas
-const searchSchema = Joi.object({
-  indent_number: Joi.string().required()
-});
-
-const approveSchema = Joi.object({
-  contract_id: Joi.string().uuid().required()
-});
-
 /**
  * @route   GET /api/contract/search
  * @desc    Search procurement details by indent number
@@ -47,44 +46,21 @@ const approveSchema = Joi.object({
  */
 router.get('/search', 
   authenticateToken,
-  validateQuery(searchSchema),
+  validateQuery(routeSchemas.contract.search),
   asyncHandler(async (req, res) => {
     const { indent_number } = req.query;
 
-    const { data: procurement, error } = await supabase
-      .from('procurement_dump')
-      .select(`
-        *,
-        allocation:allocation_id (
-          *,
-          branch_information:branch_id (
-            branch_name,
-            branch_code,
-            zone,
-            state,
-            branch_email_id
-          )
-        )
-      `)
-      .eq('indent_number', indent_number)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-      
+    // Use utility function to search procurement details
+    const result = await searchProcurementByIndent(indent_number);
 
-    if (error || !procurement) {
-      return res.status(404).json({
-        success: false,
-        message: 'Procurement details not found for the given indent number'
-      });
+    if (!result.success) {
+      if (result.error.includes('not found')) {
+        return sendErrorResponse(res, 404, result.error);
+      }
+      return handleDatabaseError(res, { message: result.error }, 'search procurement details');
     }
 
-    res.json({
-      success: true,
-      data: {
-        procurement
-      }
-    });
+    return sendSuccessResponse(res, result.data);
   })
 );
 
@@ -121,34 +97,14 @@ router.get('/pending',
   authenticateToken,
   authorizeRoles('admin'),
   asyncHandler(async (req, res) => {
-    const { data: contracts, error } = await supabase
-      .from('purchase_contract_table')
-      .select(`
-        *,
-        uploaded_user:uploaded_by (
-          first_name,
-          last_name,
-          email
-        )
-      `)
-      .eq('status', 'pending')
-      .order('uploaded_at', { ascending: false });
+    // Use utility function to get pending contracts
+    const result = await getPendingContracts();
 
-    if (error) {
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch pending contracts',
-        error: error.message
-      });
+    if (!result.success) {
+      return handleDatabaseError(res, { message: result.error }, 'fetch pending contracts');
     }
 
-    res.json({
-      success: true,
-      data: {
-        contracts,
-        count: contracts.length
-      }
-    });
+    return sendSuccessResponse(res, result.data);
   })
 );
 
@@ -160,79 +116,14 @@ router.get('/pending',
 router.get('/indent-status', 
   authenticateToken,
   asyncHandler(async (req, res) => {
-    // Get all procurement records
-    const { data: procurements, error: procurementError } = await supabase
-      .from('procurement_dump')
-      .select(`
-        indent_number,
-        firm_name,
-        bale_quantity,
-        total_amount,
-        created_at,
-        allocation:allocation_id (
-          branch_information:branch_id (
-            branch_name,
-            branch_code
-          )
-        )
-      `)
-      .order('created_at', { ascending: false });
+    // Use utility function to get indent contract status
+    const result = await getIndentContractStatus();
 
-    if (procurementError) {
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch procurement data',
-        error: procurementError.message
-      });
+    if (!result.success) {
+      return handleDatabaseError(res, { message: result.error }, 'fetch indent contract status');
     }
 
-    // Get all uploaded contracts
-    const { data: contracts, error: contractError } = await supabase
-      .from('purchase_contract_table')
-      .select('indent_number, status, uploaded_at, file_name')
-      .order('uploaded_at', { ascending: false });
-
-    if (contractError) {
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch contract data',
-        error: contractError.message
-      });
-    }
-
-    // Create a map of indent numbers to contract status
-    const contractMap = {};
-    contracts.forEach(contract => {
-      contractMap[contract.indent_number] = {
-        status: contract.status,
-        uploaded_at: contract.uploaded_at,
-        file_name: contract.file_name
-      };
-    });
-
-    // Combine procurement data with contract status
-    const indentStatus = procurements.map(procurement => ({
-      indent_number: procurement.indent_number,
-      firm_name: procurement.firm_name,
-      bale_quantity: procurement.bale_quantity,
-      total_amount: procurement.total_amount,
-      created_at: procurement.created_at,
-      branch_name: procurement.allocation?.branch_information?.branch_name,
-      branch_code: procurement.allocation?.branch_information?.branch_code,
-      contract_status: contractMap[procurement.indent_number]?.status || 'pending',
-      contract_uploaded_at: contractMap[procurement.indent_number]?.uploaded_at || null,
-      contract_file_name: contractMap[procurement.indent_number]?.file_name || null
-    }));
-
-    res.json({
-      success: true,
-      data: {
-        indent_status: indentStatus,
-        total_indents: indentStatus.length,
-        uploaded_contracts: contracts.length,
-        pending_contracts: indentStatus.filter(item => item.contract_status === 'pending').length
-      }
-    });
+    return sendSuccessResponse(res, result.data);
   })
 );
 
@@ -268,27 +159,20 @@ router.get('/logs',
       .range(offset, offset + limit - 1);
 
     if (error) {
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch contract logs',
-        error: error.message
-      });
+      return handleDatabaseError(res, error, 'fetch contract logs');
     }
 
     const totalPages = Math.ceil(count / limit);
 
-    res.json({
-      success: true,
-      data: {
-        logs,
-        pagination: {
-          current_page: page,
-          total_pages: totalPages,
-          total_records: count,
-          has_next: page < totalPages,
-          has_previous: page > 1,
-          per_page: limit
-        }
+    return sendSuccessResponse(res, {
+      logs: logs || [],
+      pagination: {
+        current_page: page,
+        total_pages: totalPages,
+        total_records: count,
+        has_next: page < totalPages,
+        has_previous: page > 1,
+        per_page: limit
       }
     });
   })

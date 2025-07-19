@@ -103,6 +103,10 @@ const routeSchemas = {
     utrSubmit: Joi.object({
       payment_id: commonFields.uuid.required(),
       utr_number: Joi.string().min(12).max(22).required()
+    }),
+    
+    sendReminder: Joi.object({
+      payment_ids: Joi.array().items(commonFields.uuid).min(1).required()
     })
   },
   
@@ -161,10 +165,7 @@ const routeSchemas = {
   // Contract routes
   contract: {
     search: Joi.object({
-      search: commonObjects.search.extract('search'),
-      status: commonFields.status,
-      start_date: commonObjects.search.extract('start_date'),
-      end_date: commonObjects.search.extract('end_date')
+      indent_number: commonFields.indentNumber.required()
     }),
     
     approve: Joi.object({
@@ -181,24 +182,52 @@ const routeSchemas = {
     
     saveSampling: Joi.object({
       indent_number: commonFields.indentNumber.required(),
-      lot_number: Joi.string().required(),
-      moisture_percentage: commonFields.percentage.required(),
-      actual_weight: commonFields.amount.required(),
-      notes: commonFields.notes
+      lots: Joi.array().items(Joi.string().min(1)).min(1).required()
+    }),
+    
+    logActivity: Joi.object({
+      indent_number: commonFields.indentNumber.required(),
+      action: Joi.string().required(),
+      notes: Joi.string().optional()
+    }),
+    
+    getHistory: Joi.object({
+      indent_number: commonFields.indentNumber.required()
     })
   },
   
   // DO Specifications routes
   doSpecifications: {
     doSpec: Joi.object({
-      indent_number: commonFields.indentNumber.required(),
-      lot_number: Joi.string().required(),
-      specifications: Joi.object({
-        fibre_length: Joi.string().required(),
-        variety: Joi.string().required(),
-        other_specs: Joi.object().optional()
-      }).required(),
-      notes: commonFields.notes
+      customer_id: commonFields.uuid.required(),
+      total_lots: commonFields.quantity.required(),
+      bid_price: commonFields.amount.required(),
+      emd_amount: commonFields.amount.required(),
+      cotton_value: commonFields.amount.required(),
+      gst_rate: commonFields.percentage.required(),
+      zone: Joi.string().valid('South Zone', 'Other Zone').required(),
+      lots: Joi.array().items(
+        Joi.object({
+          emd_paid_date: commonFields.date.required(),
+          do_payment_dates: Joi.array().items(
+            Joi.object({
+              date: commonFields.date.required(),
+              amount: commonFields.amount.required()
+            })
+          ).min(1).required(),
+          moisture_percentage: commonFields.percentage.required(),
+          actual_weight: commonFields.amount.required(),
+          carrying_days: Joi.array().items(Joi.number().integer().min(0)).required(),
+          unlifted_lots: Joi.array().items(Joi.number().integer().min(0)).required(),
+          delivery_dates: Joi.array().items(
+            Joi.object({
+              date: commonFields.date.required(),
+              lots: commonFields.quantity.required(),
+              additional_carrying_days: Joi.number().integer().min(0).required()
+            })
+          ).required()
+        })
+      ).min(1).required()
     })
   }
 };

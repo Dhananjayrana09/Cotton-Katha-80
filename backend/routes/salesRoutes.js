@@ -10,46 +10,17 @@ const { supabase } = require('../config/supabase');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { authenticateToken, authorizeRoles } = require('../middleware/auth');
 const { validateBody, validateQuery } = require('../middleware/validation');
+const { routeSchemas } = require('../utils/validationSchemas');
+const { sendErrorResponse, sendSuccessResponse, handleDatabaseError } = require('../utils/databaseHelpers');
+const { 
+  autoSelectLots, 
+  fetchSalesConfiguration, 
+  createOrUpdateSalesDraft, 
+  processSalesConfirmation, 
+  createSalesOrder 
+} = require('../utils/salesHelpers');
 
 const router = express.Router();
-
-// Validation schemas
-const autoSelectSchema = Joi.object({
-  sales_config_id: Joi.string().uuid().required(),
-  requested_qty: Joi.number().integer().min(1).required()
-});
-
-const manualSelectSchema = Joi.object({
-  sales_config_id: Joi.string().uuid().required(),
-  selected_lots: Joi.array().items(Joi.string().uuid()).min(1).required()
-});
-
-const saveDraftSchema = Joi.object({
-  sales_config_id: Joi.string().uuid().required(),
-  selected_lots: Joi.array().items(Joi.string().uuid()).min(1).required(),
-  notes: Joi.string().max(500).optional()
-});
-
-const confirmSaleSchema = Joi.object({
-  sales_config_id: Joi.string().uuid().required(),
-  selected_lots: Joi.array().items(Joi.string().uuid()).min(1).required(),
-  notes: Joi.string().max(500).optional()
-});
-
-// Validation schema for new sales order
-const newOrderSchema = Joi.object({
-  customer_id: Joi.string().uuid().required(),
-  broker_id: Joi.string().uuid().required(),
-  order_date: Joi.date().default(() => new Date()),
-  line_items: Joi.array().items(
-    Joi.object({
-      indent_number: Joi.string().required(),
-      quantity: Joi.number().integer().min(1).required(), // This is now in lots
-      broker_brokerage_per_bale: Joi.number().min(0).required(),
-      our_brokerage_per_bale: Joi.number().min(0).required()
-    })
-  ).min(1).required()
-});
 
 // Add safety check for n8n env variables at the top (we have to add the draft webhook later is used !process.env.N8N_DRAFT_WEBHOOK )
 if (!process.env.N8N_BASE_URL || !process.env.N8N_SALES_CONFIRMATION_WEBHOOK) {
@@ -88,19 +59,12 @@ router.get('/pending-orders',
       .order('created_at', { ascending: false });
 
     if (error) {
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch pending orders',
-        error: error.message
-      });
+      return handleDatabaseError(res, error, 'fetch pending orders');
     }
 
-    res.json({
-      success: true,
-      data: {
-        orders: pendingOrders,
-        count: pendingOrders.length
-      }
+    return sendSuccessResponse(res, {
+      orders: pendingOrders,
+      count: pendingOrders.length
     });
   })
 );
@@ -112,181 +76,23 @@ router.get('/pending-orders',
  */
 router.post('/auto-select-lots', 
   authenticateToken,
-  validateBody(autoSelectSchema),
+  validateBody(routeSchemas.sales.autoSelect),
   asyncHandler(async (req, res) => {
     const { sales_config_id, requested_qty } = req.body;
 
-    // Fetch sales configuration
-    const { data: salesConfig, error: configError } = await supabase
-      .from('sales_configuration')
-      .select(`
-        *,
-        customer_info:customer_id (
-          customer_name,
-          state
-        )
-      `)
-      .eq('id', sales_config_id)
-      .single();
-
-    if (configError || !salesConfig) {
-      return res.status(404).json({
-        success: false,
-        message: 'Sales configuration not found'
-      });
+    // Fetch sales configuration using utility function
+    const configResult = await fetchSalesConfiguration(sales_config_id);
+    if (!configResult.success) {
+      return sendErrorResponse(res, 404, configResult.error);
     }
 
-        // Calculate selection limits - requested_qty is already in lots
-    const base = requested_qty;
-    const extra = Math.floor(base * 0.2); // 20% extra for flexibility
-    const maxLimit = base + extra;
-
-    // Build query for available lots with enhanced selection
-    let lotsQuery = supabase
-      .from('inventory_table')
-      .select(`
-        *,
-        branch_information:branch_id (
-          branch_name,
-          zone
-        )
-      `)
-      .eq('status', 'AVAILABLE');
-
-    // Apply filters based on line specs
-    if (salesConfig.line_specs) {
-      const specs = salesConfig.line_specs;
-      
-      if (specs.fibre_length) {
-        lotsQuery = lotsQuery.eq('fibre_length', specs.fibre_length);
-      }
-      
-      if (specs.variety) {
-        lotsQuery = lotsQuery.eq('variety', specs.variety);
-      }
+    // Auto-select lots using utility function
+    const result = await autoSelectLots(configResult.data, requested_qty);
+    if (!result.success) {
+      return handleDatabaseError(res, { message: result.error }, 'auto-select lots');
     }
 
-    // Priority: same branch first (enhanced logic)
-    if (salesConfig.priority_branch) {
-      // First try to get lots from priority branch
-      const { data: priorityLots, error: priorityError } = await lotsQuery
-        .eq('branch', salesConfig.priority_branch)
-        .order('created_at', { ascending: true })
-        .limit(maxLimit);
-      
-      if (!priorityError && priorityLots && priorityLots.length >= base) {
-        // If we have enough lots from priority branch, return them
-        const autoSelected = priorityLots.slice(0, Math.min(maxLimit, priorityLots.length));
-        const totalValue = autoSelected.reduce((sum, lot) => sum + (lot.bid_price || 0), 0);
-
-        return res.json({
-          success: true,
-          data: {
-            sales_config: salesConfig,
-            available_lots: priorityLots,
-            auto_selected: autoSelected,
-            selection_limits: {
-              requested: requested_qty,
-              required_bales: base,
-              max_allowed: maxLimit,
-              auto_selected_count: autoSelected.length
-            },
-            total_value: totalValue,
-            out_of_stock: false,
-            priority_branch_used: true
-          }
-        });
-      }
-    }
-
-    // Order by FIFO (first in, first out) and get all available lots
-    lotsQuery = lotsQuery
-      .order('created_at', { ascending: true });
-
-    const { data: availableLots, error: lotsError } = await lotsQuery;
-
-    if (lotsError) {
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch available lots',
-        error: lotsError.message
-      });
-    }
-
-    if (!availableLots || availableLots.length === 0) {
-      return res.json({
-        success: true,
-        message: 'No available lots found matching the criteria',
-        data: {
-          available_lots: [],
-          auto_selected: [],
-          out_of_stock: true
-        }
-      });
-    }
-
-    // Auto-select lots with enhanced logic
-    let autoSelected = [];
-    
-    // If priority branch didn't have enough lots, try to get remaining from other branches
-    if (salesConfig.priority_branch && availableLots.length > 0) {
-      // Get priority branch lots first
-      const priorityLots = availableLots.filter(lot => lot.branch === salesConfig.priority_branch);
-      autoSelected = [...priorityLots];
-      
-      // Add remaining lots from other branches if needed
-      const remainingLots = availableLots.filter(lot => lot.branch !== salesConfig.priority_branch);
-      const needed = Math.max(0, base - autoSelected.length);
-      autoSelected = [...autoSelected, ...remainingLots.slice(0, needed)];
-    } else {
-      // No priority branch or no priority branch lots, select from all available
-      autoSelected = availableLots.slice(0, Math.min(maxLimit, availableLots.length));
-    }
-
-    // Fetch allocation details for each unique indent_number
-    const indentNumbers = [...new Set(availableLots.map(lot => lot.indent_number))];
-    let allocationDetailsMap = {};
-    if (indentNumbers.length > 0) {
-      const { data: allocations, error: allocationError } = await supabase
-        .from('allocation')
-        .select('*')
-        .in('indent_number', indentNumbers);
-      if (!allocationError && allocations) {
-        allocationDetailsMap = allocations.reduce((acc, alloc) => {
-          acc[alloc.indent_number] = alloc;
-          return acc;
-        }, {});
-      }
-    }
-    // Attach allocation details to each lot
-    const lotsWithAlloc = availableLots.map(lot => ({
-      ...lot,
-      allocation_details: allocationDetailsMap[lot.indent_number] || null
-    }));
-    const autoSelectedWithAlloc = autoSelected.map(lot => ({
-      ...lot,
-      allocation_details: allocationDetailsMap[lot.indent_number] || null
-    }));
-    // Calculate total value
-    const totalValue = autoSelectedWithAlloc.reduce((sum, lot) => sum + (lot.bid_price || 0), 0);
-
-    res.json({
-      success: true,
-      data: {
-        sales_config: salesConfig,
-        available_lots: lotsWithAlloc,
-        auto_selected: autoSelectedWithAlloc,
-        selection_limits: {
-          requested: requested_qty,
-          required_bales: base,
-          max_allowed: maxLimit,
-          auto_selected_count: autoSelectedWithAlloc.length
-        },
-        total_value: totalValue,
-        out_of_stock: false,
-        priority_branch_used: false
-      }
-    });
+    return sendSuccessResponse(res, result.data);
   })
 );
 
@@ -297,22 +103,14 @@ router.post('/auto-select-lots',
  */
 router.post('/manual-lot-selection', 
   authenticateToken,
-  validateBody(manualSelectSchema),
+  validateBody(routeSchemas.sales.manualSelect),
   asyncHandler(async (req, res) => {
     const { sales_config_id, selected_lots } = req.body;
 
-    // Fetch sales configuration
-    const { data: salesConfig, error: configError } = await supabase
-      .from('sales_configuration')
-      .select('*')
-      .eq('id', sales_config_id)
-      .single();
-
-    if (configError || !salesConfig) {
-      return res.status(404).json({
-        success: false,
-        message: 'Sales configuration not found'
-      });
+    // Fetch sales configuration using utility function
+    const configResult = await fetchSalesConfiguration(sales_config_id);
+    if (!configResult.success) {
+      return sendErrorResponse(res, 404, configResult.error);
     }
 
     // Fetch selected lots details
@@ -323,38 +121,27 @@ router.post('/manual-lot-selection',
       .eq('status', 'AVAILABLE');
 
     if (lotsError) {
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch selected lots',
-        error: lotsError.message
-      });
+      return handleDatabaseError(res, lotsError, 'fetch selected lots');
     }
 
     // Validate selection
-    const requestedQty = salesConfig.requested_quantity;
+    const requestedQty = configResult.data.requested_quantity;
     const selectedCount = lots.length;
 
     if (selectedCount < requestedQty) {
-      return res.status(400).json({
-        success: false,
-        message: `Please select at least ${requestedQty} lots. Currently selected: ${selectedCount}`
-      });
+      return sendErrorResponse(res, 400, `Please select at least ${requestedQty} lots. Currently selected: ${selectedCount}`);
     }
 
     // Calculate total value
     const totalValue = lots.reduce((sum, lot) => sum + (lot.bid_price || 0), 0);
 
-    res.json({
-      success: true,
-      message: 'Lot selection validated successfully',
-      data: {
-        selected_lots: lots,
-        total_selected: selectedCount,
-        required_minimum: requestedQty,
-        total_value: totalValue,
-        validation_passed: true
-      }
-    });
+    return sendSuccessResponse(res, {
+      selected_lots: lots,
+      total_selected: selectedCount,
+      required_minimum: requestedQty,
+      total_value: totalValue,
+      validation_passed: true
+    }, 'Lot selection validated successfully');
   })
 );
 
@@ -365,149 +152,17 @@ router.post('/manual-lot-selection',
  */
 router.post('/save-draft', 
   authenticateToken,
-  validateBody(saveDraftSchema),
+  validateBody(routeSchemas.sales.saveDraft),
   asyncHandler(async (req, res) => {
     const { sales_config_id, selected_lots, notes } = req.body;
 
-    try {
-      // Fetch sales configuration
-      const { data: salesConfig, error: configError } = await supabase
-        .from('sales_configuration')
-        .select(`
-          *,
-          customer_info:customer_id (*),
-          broker_info:broker_id (*)
-        `)
-        .eq('id', sales_config_id)
-        .single();
-
-      if (configError || !salesConfig) {
-        return res.status(404).json({
-          success: false,
-          message: 'Sales configuration not found'
-        });
-      }
-
-      // Fetch selected lots
-      const { data: lots, error: lotsError } = await supabase
-        .from('inventory_table')
-        .select('*')
-        .in('id', selected_lots);
-
-      if (lotsError) {
-        return res.status(500).json({
-          success: false,
-          message: 'Failed to fetch selected lots',
-          error: lotsError.message
-        });
-      }
-
-      // Calculate totals
-      const totalBales = lots.length;
-      const totalValue = lots.reduce((sum, lot) => sum + (lot.bid_price || 0), 0);
-      const brokerCommission = (totalValue * (salesConfig.broker_info.commission_rate || 0)) / 100;
-
-      // Create sales record
-      const salesData = {
-        sales_config_id,
-        indent_numbers: [...new Set(lots.map(lot => lot.indent_number))],
-        total_bales: totalBales,
-        total_value: totalValue,
-        broker_commission: brokerCommission,
-        status: 'DRAFT',
-        created_by: req.user.id
-      };
-
-      const { data: salesRecord, error: salesError } = await supabase
-        .from('sales_table')
-        .insert(salesData)
-        .select()
-        .single();
-
-      if (salesError) {
-        throw new Error(`Failed to create sales record: ${salesError.message}`);
-      }
-
-      // Create lot selections
-      const lotSelections = lots.map(lot => ({
-        sales_id: salesRecord.id,
-        inventory_id: lot.id,
-        lot_number: lot.lot_number,
-        indent_number: lot.indent_number,
-        quantity: 1, // Assuming 1 bale per lot
-        price: lot.bid_price || 0,
-        status: 'SELECTED'
-      }));
-
-      const { error: selectionsError } = await supabase
-        .from('lot_selected_contract')
-        .insert(lotSelections);
-
-      if (selectionsError) {
-        throw new Error(`Failed to save lot selections: ${selectionsError.message}`);
-      }
-
-      // Block the selected lots
-      const { error: blockError } = await supabase
-        .from('inventory_table')
-        .update({ status: 'BLOCKED', updated_at: new Date().toISOString() })
-        .in('id', selected_lots);
-
-      if (blockError) {
-        throw new Error(`Failed to block lots: ${blockError.message}`);
-      }
-
-      // Update sales configuration status
-      await supabase
-        .from('sales_configuration')
-        .update({ status: 'processing', updated_at: new Date().toISOString() })
-        .eq('id', sales_config_id);
-
-      // Log the draft creation
-      await supabase
-        .from('audit_log')
-        .insert({
-          table_name: 'sales_table',
-          record_id: salesRecord.id,
-          action: 'SALES_DRAFT_CREATED',
-          user_id: req.user.id,
-          new_values: { ...salesData, lots_count: totalBales, notes }
-        });
-
-      // Trigger n8n webhook for draft notification (commented out as per latest requirements)
-      /*
-      try {
-        const draftWebhookUrl = `${process.env.N8N_BASE_URL}${process.env.N8N_SALES_DRAFT_WEBHOOK}`;
-        await axios.post(draftWebhookUrl, {
-          sales_id: salesRecord.id,
-          customer: salesConfig.customer_info,
-          broker: salesConfig.broker_info,
-          total_bales: totalBales,
-          total_value: totalValue,
-          created_by: req.user,
-          notes
-        });
-      } catch (webhookError) {
-        console.error('n8n draft webhook failed:', webhookError);
-      }
-      */
-
-      res.status(201).json({
-        success: true,
-        message: 'Sales draft saved successfully',
-        data: {
-          sales_record: salesRecord,
-          blocked_lots: lots.length,
-          total_value: totalValue,
-          broker_commission: brokerCommission
-        }
-      });
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        message: error.message
-      });
+    // Use utility function to create or update sales draft
+    const result = await createOrUpdateSalesDraft(sales_config_id, selected_lots, req.user.id, notes);
+    if (!result.success) {
+      return handleDatabaseError(res, { message: result.error }, 'save sales draft');
     }
+
+    return sendSuccessResponse(res, result.data, 'Sales draft saved successfully');
   })
 );
 
@@ -518,280 +173,21 @@ router.post('/save-draft',
  */
 router.post('/confirm', 
   authenticateToken,
-  validateBody(confirmSaleSchema),
+  validateBody(routeSchemas.sales.confirmSale),
   asyncHandler(async (req, res) => {
     const { sales_config_id, selected_lots, notes } = req.body;
 
-    try {
-      // First create/update as draft, then confirm
-      const draftResult = await createOrUpdateSalesDraft(sales_config_id, selected_lots, req.user.id);
-      
-      if (!draftResult.success) {
-        return res.status(400).json(draftResult);
-      }
-
-      const salesRecord = draftResult.data;
-
-      // Confirm the sales record
-      const { data: confirmedSales, error: confirmError } = await supabase
-        .from('sales_table')
-        .update({
-          status: 'CONFIRMED',
-          confirmed_by: req.user.id,
-          confirmed_at: new Date().toISOString()
-        })
-        .eq('id', salesRecord.id)
-        .select()
-        .single();
-
-      if (confirmError) {
-        throw new Error(`Failed to confirm sales: ${confirmError.message}`);
-      }
-
-      // Mark sales configuration as completed
-      await supabase
-        .from('sales_configuration')
-        .update({ status: 'completed', updated_at: new Date().toISOString() })
-        .eq('id', sales_config_id);
-
-      // Log the confirmation
-      await supabase
-        .from('audit_log')
-        .insert({
-          table_name: 'sales_table',
-          record_id: salesRecord.id,
-          action: 'SALES_CONFIRMED',
-          user_id: req.user.id,
-          new_values: { status: 'CONFIRMED', notes }
-        });
-
-      // Fetch complete data for webhook including lot details
-      const { data: completeData } = await supabase
-        .from('sales_table')
-        .select(`
-          *,
-          sales_configuration:sales_config_id (
-            customer_info:customer_id (*),
-            broker_info:broker_id (*),
-            requested_quantity,
-            lifting_period,
-            priority_branch,
-            line_specs
-          ),
-          lot_selected_contract (
-            *,
-            inventory_table:inventory_id (
-              *,
-              branch_information:branch_id (
-                branch_name,
-                zone
-              )
-            )
-          )
-        `)
-        .eq('id', salesRecord.id)
-        .single();
-
-      // Fetch allocation details for all indent numbers
-      const indentNumbers = completeData.indent_numbers || [];
-      let allocationDetailsMap = {};
-      if (indentNumbers.length > 0) {
-        const { data: allocations, error: allocationError } = await supabase
-          .from('allocation')
-          .select('*')
-          .in('indent_number', indentNumbers);
-        if (!allocationError && allocations) {
-          allocationDetailsMap = allocations.reduce((acc, alloc) => {
-            acc[alloc.indent_number] = alloc;
-            return acc;
-          }, {});
-        }
-      }
-
-      // Prepare lot details with allocation information
-      const lotDetails = completeData.lot_selected_contract?.map(lotSelection => {
-        const inventory = lotSelection.inventory_table;
-        const allocation = allocationDetailsMap[inventory?.indent_number] || null;
-        
-        return {
-          lot_number: inventory?.lot_number,
-          indent_number: inventory?.indent_number,
-          centre_name: inventory?.centre_name,
-          branch: inventory?.branch,
-          branch_zone: inventory?.branch_information?.zone,
-          date: inventory?.date,
-          lifting_period: inventory?.lifting_period,
-          fibre_length: inventory?.fibre_length,
-          variety: inventory?.variety,
-          bid_price: inventory?.bid_price,
-          quantity: lotSelection.quantity,
-          price: lotSelection.price,
-          status: lotSelection.status,
-          allocation_details: allocation ? {
-            crop_year: allocation.crop_year,
-            buyer_type: allocation.buyer_type,
-            otr_price: allocation.otr_price,
-            allocation_status: allocation.allocation_status
-          } : null
-        };
-      }) || [];
-
-      // Trigger n8n webhook for confirmation
-      try {
-        let confirmWebhookUrl;
-        if (process.env.N8N_SALES_CONFIRMATION_WEBHOOK?.startsWith('http')) {
-          confirmWebhookUrl = process.env.N8N_SALES_CONFIRMATION_WEBHOOK;
-        } else {
-          confirmWebhookUrl = `${process.env.N8N_BASE_URL}${process.env.N8N_SALES_CONFIRMATION_WEBHOOK}`;
-        }
-        await axios.post(confirmWebhookUrl, {
-          sales_id: salesRecord.id,
-          customer: completeData.sales_configuration.customer_info,
-          broker: completeData.sales_configuration.broker_info,
-          sales_configuration: {
-            requested_quantity: completeData.sales_configuration.requested_quantity,
-            lifting_period: completeData.sales_configuration.lifting_period,
-            priority_branch: completeData.sales_configuration.priority_branch,
-            line_specs: completeData.sales_configuration.line_specs
-          },
-          total_bales: confirmedSales.total_bales,
-          total_value: confirmedSales.total_value,
-          broker_commission: confirmedSales.broker_commission,
-          indent_numbers: completeData.indent_numbers,
-          lot_details: lotDetails,
-          confirmed_by: req.user,
-          confirmed_at: confirmedSales.confirmed_at,
-          notes
-        });
-      } catch (webhookError) {
-        console.error('n8n confirmation webhook failed:', webhookError);
-      }
-
-      res.json({
-        success: true,
-        message: 'Sales order confirmed successfully',
-        data: {
-          sales_record: confirmedSales,
-          status: 'CONFIRMED'
-        }
-      });
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        message: error.message
-      });
+    // Use utility function to process sales confirmation
+    const result = await processSalesConfirmation(sales_config_id, selected_lots, req.user.id, notes);
+    if (!result.success) {
+      return handleDatabaseError(res, { message: result.error }, 'confirm sales order');
     }
+
+    return sendSuccessResponse(res, result.data, 'Sales order confirmed successfully');
   })
 );
 
-/**
- * Helper function to create or update sales draft
- */
-async function createOrUpdateSalesDraft(sales_config_id, selected_lots, user_id) {
-  try {
-    // Check if draft already exists
-    const { data: existingDraft, error: draftError } = await supabase
-      .from('sales_table')
-      .select('*')
-      .eq('sales_config_id', sales_config_id)
-      .eq('status', 'DRAFT')
-      .single();
 
-    if (draftError && draftError.code !== 'PGRST116') {
-      throw new Error(`Failed to check existing draft: ${draftError.message}`);
-    }
-
-    // If a draft exists, update it; otherwise create new
-    if (existingDraft) {
-      // Update existing draft logic here (optional: update lots, etc.)
-      return { success: true, data: existingDraft };
-    } else {
-      // --- Begin: Create new draft logic (copied from /save-draft route) ---
-      // Fetch sales configuration
-      const { data: salesConfig, error: configError } = await supabase
-        .from('sales_configuration')
-        .select(`*, customer_info:customer_id (*), broker_info:broker_id (*)`)
-        .eq('id', sales_config_id)
-        .single();
-      if (configError || !salesConfig) {
-        return { success: false, message: 'Sales configuration not found' };
-      }
-      // Fetch selected lots
-      const { data: lots, error: lotsError } = await supabase
-        .from('inventory_table')
-        .select('*')
-        .in('id', selected_lots);
-      if (lotsError) {
-        return { success: false, message: 'Failed to fetch selected lots', error: lotsError.message };
-      }
-      // Calculate totals
-      const totalBales = lots.length;
-      const totalValue = lots.reduce((sum, lot) => sum + (lot.bid_price || 0), 0);
-      const brokerCommission = (totalValue * (salesConfig.broker_info.commission_rate || 0)) / 100;
-      // Create sales record
-      const salesData = {
-        sales_config_id,
-        indent_numbers: [...new Set(lots.map(lot => lot.indent_number))],
-        total_bales: totalBales,
-        total_value: totalValue,
-        broker_commission: brokerCommission,
-        status: 'DRAFT',
-        created_by: user_id
-      };
-      const { data: salesRecord, error: salesError } = await supabase
-        .from('sales_table')
-        .insert(salesData)
-        .select()
-        .single();
-      if (salesError) {
-        return { success: false, message: `Failed to create sales record: ${salesError.message}` };
-      }
-      // Create lot selections
-      const lotSelections = lots.map(lot => ({
-        sales_id: salesRecord.id,
-        inventory_id: lot.id,
-        lot_number: lot.lot_number,
-        indent_number: lot.indent_number,
-        quantity: 1, // Assuming 1 bale per lot
-        price: lot.bid_price || 0,
-        status: 'SELECTED'
-      }));
-      const { error: selectionsError } = await supabase
-        .from('lot_selected_contract')
-        .insert(lotSelections);
-      if (selectionsError) {
-        return { success: false, message: `Failed to save lot selections: ${selectionsError.message}` };
-      }
-      // Block the selected lots
-      const { error: blockError } = await supabase
-        .from('inventory_table')
-        .update({ status: 'BLOCKED', updated_at: new Date().toISOString() })
-        .in('id', selected_lots);
-      if (blockError) {
-        return { success: false, message: `Failed to block lots: ${blockError.message}` };
-      }
-      // Update sales configuration status
-      await supabase
-        .from('sales_configuration')
-        .update({ status: 'processing', updated_at: new Date().toISOString() })
-        .eq('id', sales_config_id);
-      // Log the draft creation
-      await supabase
-        .from('audit_log')
-        .insert({
-          table_name: 'sales_table',
-          record_id: salesRecord.id,
-          action: 'SALES_DRAFT_CREATED',
-          user_id: user_id,
-          new_values: { ...salesData, lots_count: totalBales }
-        });
-      // --- End: Create new draft logic ---
-      return { success: true, data: salesRecord };
-    }
-  } catch (error) {
-    return { success: false, message: error.message };
-  }
-}
 
 /**
  * @route   GET /api/sales/:id
@@ -831,18 +227,10 @@ router.get('/:id',
       .single();
 
     if (error || !salesRecord) {
-      return res.status(404).json({
-        success: false,
-        message: 'Sales record not found'
-      });
+      return sendErrorResponse(res, 404, 'Sales record not found');
     }
 
-    res.json({
-      success: true,
-      data: {
-        sales_record: salesRecord
-      }
-    });
+    return sendSuccessResponse(res, { sales_record: salesRecord });
   })
 );
 
@@ -854,218 +242,61 @@ router.get('/:id',
 router.post('/new', 
   authenticateToken,
   authorizeRoles('admin', 'trader'),
-  validateBody(newOrderSchema),
+  validateBody(routeSchemas.sales.newOrder),
   asyncHandler(async (req, res) => {
     const { customer_id, broker_id, order_date, line_items } = req.body;
 
-    // Validate customer
-    const { data: customer, error: customerError } = await supabase
-      .from('customer_info')
-      .select('*')
-      .eq('id', customer_id)
-      .single();
-    if (customerError || !customer) {
-      return res.status(404).json({ success: false, message: 'Customer not found' });
+    // Use utility function to create sales order
+    const result = await createSalesOrder(req.body, req.user.id);
+    if (!result.success) {
+      return sendErrorResponse(res, 400, result.error);
     }
 
-    // Validate broker
-    const { data: broker, error: brokerError } = await supabase
-      .from('broker_info')
-      .select('*')
-      .eq('id', broker_id)
-      .single();
-    if (brokerError || !broker) {
-      return res.status(404).json({ success: false, message: 'Broker not found' });
-    }
-
-    // Validate and fetch indents for each line item
-    const indentNumbers = line_items.map(item => item.indent_number);
-    
-    // Fetch indents from procurement_dump table
-    const { data: indents, error: indentError } = await supabase
-      .from('procurement_dump')
-      .select(`
-        *,
-        allocation:allocation_id (
-          indent_number,
-          lifting_period,
-          bale_quantity,
-          otr_price,
-          branch_name,
-          zone,
-          allocation_status,
-          parsed_data:parsed_data_id (
-            fibre_length,
-            variety
-          )
-        )
-      `)
-      .in('indent_number', indentNumbers);
-    
-    if (indentError) {
-      return res.status(500).json({ success: false, message: 'Failed to fetch indents', error: indentError.message });
-    }
-    
-    if (!indents || indents.length !== line_items.length) {
-      return res.status(400).json({ success: false, message: 'One or more indents are invalid' });
-    }
-
-    // Validate each indent and check available quantity
-    for (let i = 0; i < line_items.length; i++) {
-      const lineItem = line_items[i];
-      const indent = indents.find(ind => ind.indent_number === lineItem.indent_number);
-      
-      if (!indent) {
-        return res.status(400).json({ 
-          success: false, 
-          message: `Indent ${lineItem.indent_number} not found in procurement table` 
-        });
-      }
-
-      // Check if indent is active
-      if (indent.allocation?.allocation_status !== 'active') {
-        return res.status(400).json({ 
-          success: false, 
-          message: `Indent ${lineItem.indent_number} is not active for sales` 
-        });
-      }
-
-      // Check available quantity (total bales in indent vs already sold)
-      const totalBalesInIndent = indent.allocation?.bale_quantity || 0;
-      
-      // Get already sold quantity for this indent
-      const { data: soldLots, error: soldError } = await supabase
-        .from('lot_selected_contract')
-        .select('quantity')
-        .eq('indent_number', lineItem.indent_number);
-      
-      if (soldError) {
-        return res.status(500).json({ 
-          success: false, 
-          message: 'Failed to check sold quantity', 
-          error: soldError.message 
-        });
-      }
-      
-      const alreadySold = soldLots?.reduce((sum, lot) => sum + (lot.quantity || 0), 0) || 0;
-      const availableBales = totalBalesInIndent - alreadySold;
-      
-      if (lineItem.quantity > availableBales) {
-        return res.status(400).json({ 
-          success: false, 
-          message: `Indent ${lineItem.indent_number} has only ${availableBales} bales available, but ${lineItem.quantity} requested` 
-        });
-      }
-    }
-
-    // Get lifting period from first indent (they should all be the same for a single order)
-    const lifting_period = indents[0]?.allocation?.lifting_period;
-    if (!lifting_period) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Lifting period not found for the indent' 
-      });
-    }
-
-    // Build line specs (for filtering lots later)
-    const lineSpecs = {
-      variety: indents[0]?.allocation?.parsed_data?.variety || 'Any',
-      fibre_length: indents[0]?.allocation?.parsed_data?.fibre_length || 'Any'
-    };
-
-    // Calculate total requested quantity from line items
-    const totalRequestedQuantity = line_items.reduce((sum, item) => sum + item.quantity, 0);
-
-    // Create sales configuration with line items stored in line_specs
-    const { data: salesConfig, error: configError } = await supabase
-      .from('sales_configuration')
-      .insert({
-        customer_id,
-        broker_id,
-        order_date,
-        requested_quantity: totalRequestedQuantity,
-        lifting_period,
-        line_specs: {
-          ...lineSpecs,
-          line_items: line_items.map(item => ({
-            indent_number: item.indent_number,
-            quantity: item.quantity,
-            broker_brokerage_per_bale: item.broker_brokerage_per_bale,
-            our_brokerage_per_bale: item.our_brokerage_per_bale
-          }))
-        },
-        status: 'pending',
-        created_by: req.user.id,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .select()
-      .single();
-    if (configError) {
-      return res.status(500).json({ success: false, message: 'Failed to create sales configuration', error: configError.message });
-    }
-
-    // Log creation
-    await supabase.from('audit_log').insert({
-      table_name: 'sales_configuration',
-      record_id: salesConfig.id,
-      action: 'SALES_ORDER_CREATED',
-      user_id: req.user.id,
-      new_values: { customer_id, broker_id, requested_quantity: totalRequestedQuantity, line_items }
-    });
-
-    // Trigger n8n webhook for contract PDF/email
-    try {
-      const webhookUrl = process.env.N8N_SALES_CONTRACT_GENERATE_PDF_WEBHOOK || `${process.env.N8N_BASE_URL}${process.env.N8N_SALES_CONTRACT_GENERATE_PDF_WEBHOOK}`;
-      await axios.post(webhookUrl, {
-        sales_config_id: salesConfig.id,
-        customer,
-        broker,
-        line_items,
-        order_date,
-        requested_quantity: totalRequestedQuantity,
-        created_by: req.user,
-      });
-      // Log CONTRACT_SENT
-      await supabase.from('audit_log').insert({
-        table_name: 'sales_configuration',
-        record_id: salesConfig.id,
-        action: 'CONTRACT_SENT',
-        user_id: req.user.id,
-        new_values: { webhook: 'triggered', customer_id, broker_id }
-      });
-    } catch (webhookError) {
-      console.error('n8n contract webhook failed:', webhookError);
-      // Do not block main flow
-    }
-
-    res.status(201).json({
-      success: true,
-      message: 'Sales order created successfully',
-      data: { sales_config: salesConfig }
-    });
+    return sendSuccessResponse(res, result.data, 'Sales order created successfully', 201);
   })
 );
 
-// GET /api/customer-info
-router.get('/customer-info', authenticateToken, asyncHandler(async (req, res) => {
-  const { data, error } = await supabase
-    .from('customer_info')
-    .select('*')
-    .order('customer_name', { ascending: true });
-  if (error) return res.status(500).json({ success: false, message: 'Failed to fetch customers', error: error.message });
-  res.json({ data: { customers: data } });
-}));
+/**
+ * @route   GET /api/sales/customer-info
+ * @desc    Get all customers for sales order creation
+ * @access  Private
+ */
+router.get('/customer-info', 
+  authenticateToken, 
+  asyncHandler(async (req, res) => {
+    const { data, error } = await supabase
+      .from('customer_info')
+      .select('*')
+      .order('customer_name', { ascending: true });
+    
+    if (error) {
+      return handleDatabaseError(res, error, 'fetch customers');
+    }
+    
+    return sendSuccessResponse(res, { customers: data });
+  })
+);
 
-// GET /api/broker-info
-router.get('/broker-info', authenticateToken, asyncHandler(async (req, res) => {
-  const { data, error } = await supabase
-    .from('broker_info')
-    .select('*')
-    .order('broker_name', { ascending: true });
-  if (error) return res.status(500).json({ success: false, message: 'Failed to fetch brokers', error: error.message });
-  res.json({ data: { brokers: data } });
-}));
+/**
+ * @route   GET /api/sales/broker-info
+ * @desc    Get all brokers for sales order creation
+ * @access  Private
+ */
+router.get('/broker-info', 
+  authenticateToken, 
+  asyncHandler(async (req, res) => {
+    const { data, error } = await supabase
+      .from('broker_info')
+      .select('*')
+      .order('broker_name', { ascending: true });
+    
+    if (error) {
+      return handleDatabaseError(res, error, 'fetch brokers');
+    }
+    
+    return sendSuccessResponse(res, { brokers: data });
+  })
+);
 
 /**
  * @route   POST /api/sales/validate-indent
@@ -1103,18 +334,12 @@ router.post('/validate-indent',
       .single();
 
     if (indentError || !indent) {
-      return res.status(404).json({
-        success: false,
-        message: 'Indent not found in procurement table'
-      });
+      return sendErrorResponse(res, 404, 'Indent not found in procurement table');
     }
 
     // Check if indent is active
     if (indent.allocation?.allocation_status !== 'active') {
-      return res.status(400).json({
-        success: false,
-        message: 'Indent is not active for sales'
-      });
+      return sendErrorResponse(res, 400, 'Indent is not active for sales');
     }
 
     // Get already sold quantity for this indent
@@ -1124,11 +349,7 @@ router.post('/validate-indent',
       .eq('indent_number', indent_number);
     
     if (soldError) {
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to check sold quantity',
-        error: soldError.message
-      });
+      return handleDatabaseError(res, soldError, 'check sold quantity');
     }
     
     const alreadySold = soldLots?.reduce((sum, lot) => sum + (lot.quantity || 0), 0) || 0;
@@ -1136,27 +357,21 @@ router.post('/validate-indent',
     const availableBales = totalBales - alreadySold;
 
     if (availableBales <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'No units available for this indent'
-      });
+      return sendErrorResponse(res, 400, 'No units available for this indent');
     }
 
-    res.json({
-      success: true,
-      data: {
-        indent: {
-          indent_number: indent.indent_number,
-          bales_quantity: totalBales,
-          available_bales: availableBales,
-          centre_name: indent.allocation?.branch_name || 'N/A',
-          branch: indent.allocation?.branch_name || 'N/A',
-          date: indent.created_at,
-          lifting_period: indent.allocation?.lifting_period,
-          fibre_length: indent.allocation?.parsed_data?.fibre_length || 'N/A',
-          variety: indent.allocation?.parsed_data?.variety || 'N/A',
-          bid_price: indent.allocation?.otr_price
-        }
+    return sendSuccessResponse(res, {
+      indent: {
+        indent_number: indent.indent_number,
+        bales_quantity: totalBales,
+        available_bales: availableBales,
+        centre_name: indent.allocation?.branch_name || 'N/A',
+        branch: indent.allocation?.branch_name || 'N/A',
+        date: indent.created_at,
+        lifting_period: indent.allocation?.lifting_period,
+        fibre_length: indent.allocation?.parsed_data?.fibre_length || 'N/A',
+        variety: indent.allocation?.parsed_data?.variety || 'N/A',
+        bid_price: indent.allocation?.otr_price
       }
     });
   })

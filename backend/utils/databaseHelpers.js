@@ -64,6 +64,49 @@ const selectPatterns = {
   // User info with all fields
   userFull: `
     created_user:created_by (*)
+  `,
+  
+  // Sales configuration with basic fields
+  salesConfigBasic: `
+    sales_configuration:sales_config_id (
+      id,
+      status,
+      created_at
+    )
+  `,
+  
+  // Sales configuration with all fields
+  salesConfigFull: `
+    sales_configuration:sales_config_id (*)
+  `,
+  
+  // Inventory with basic fields for sales
+  inventorySalesBasic: `
+    inventory_table:inventory_id (
+      lot_number,
+      indent_number,
+      centre_name,
+      branch,
+      variety,
+      fibre_length,
+      bid_price,
+      status
+    )
+  `,
+  
+  // Customer assignment with basic fields
+  assignmentBasic: `
+    customer_assignment_table:assignment_id (
+      id,
+      lot_status,
+      assigned_at,
+      window_end_date
+    )
+  `,
+  
+  // Customer assignment with all fields
+  assignmentFull: `
+    customer_assignment_table:assignment_id (*)
   `
 };
 

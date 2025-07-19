@@ -4,25 +4,27 @@
  */
 
 const express = require('express');
-const Joi = require('joi');
 const axios = require('axios');
 const { supabase } = require('../config/supabase');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { authenticateToken, authorizeRoles } = require('../middleware/auth');
 const { validateBody } = require('../middleware/validation');
+const { routeSchemas } = require('../utils/validationSchemas');
+const { sendErrorResponse, sendSuccessResponse, handleDatabaseError } = require('../utils/databaseHelpers');
+const {
+  getCustomerId,
+  categorizeAssignments,
+  autoExpireAssignments,
+  calculateAssignmentSummary,
+  fetchCustomerAssignments,
+  fetchAssignmentDetails,
+  validateAssignmentOwnership,
+  processAssignmentAcceptance,
+  processAssignmentRejection,
+  checkAndTriggerConfirmation
+} = require('../utils/customerLotsHelpers');
 
 const router = express.Router();
-
-// Validation schemas
-const acceptRejectSchema = Joi.object({
-  assignment_id: Joi.string().uuid().required()
-});
-
-const adminOverrideSchema = Joi.object({
-  assignment_id: Joi.string().uuid().required(),
-  action: Joi.string().valid('accept', 'reject').required(),
-  notes: Joi.string().max(500).optional()
-});
 
 // Safety check for required n8n env variables
 if (!process.env.N8N_BASE_URL || !process.env.N8N_LOT_ACCEPTANCE_CONFIRMATION_WEBHOOK) {
@@ -37,128 +39,39 @@ if (!process.env.N8N_BASE_URL || !process.env.N8N_LOT_ACCEPTANCE_CONFIRMATION_WE
 router.get('/lots', 
   authenticateToken,
   asyncHandler(async (req, res) => {
-    let customerId = req.user.id;
-
-    // If user is not a customer, find their customer record
-    if (req.user.role !== 'customer') {
-      const { data: customerInfo, error: customerError } = await supabase
-        .from('customer_info')
-        .select('id')
-        .eq('email', req.user.email)
-        .single();
-
-      if (customerError || !customerInfo) {
-        return res.status(404).json({
-          success: false,
-          message: 'Customer record not found'
-        });
-      }
-      customerId = customerInfo.id;
+    // Get customer ID using utility function
+    const customerResult = await getCustomerId(req.user);
+    if (!customerResult.success) {
+      return sendErrorResponse(res, 404, customerResult.error);
     }
 
     // Get current date to check window periods
     const currentDate = new Date().toISOString().split('T')[0];
 
-    const { data: assignments, error } = await supabase
-      .from('customer_assignment_table')
-      .select(`
-        *,
-        inventory_table:inventory_id (
-          lot_number,
-          indent_number,
-          centre_name,
-          branch,
-          variety,
-          fibre_length,
-          bid_price
-        ),
-        sales_table:sales_id (
-          total_value,
-          broker_commission
-        ),
-        assigned_user:assigned_by (
-          first_name,
-          last_name
-        )
-      `)
-      .eq('customer_id', customerId)
-      .order('assigned_at', { ascending: false });
-
-    if (error) {
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch lot assignments',
-        error: error.message
-      });
+    // Fetch assignments using utility function
+    const assignmentsResult = await fetchCustomerAssignments(customerResult.customerId);
+    if (!assignmentsResult.success) {
+      return handleDatabaseError(res, { message: assignmentsResult.error }, 'fetch lot assignments');
     }
 
-    // Categorize assignments
-    const activeAssignments = [];
-    const expiredAssignments = [];
-    const respondedAssignments = [];
+    const assignments = assignmentsResult.data;
 
-    assignments.forEach(assignment => {
-      const isWithinWindow = currentDate <= assignment.window_end_date;
-      const isPending = assignment.lot_status === 'PENDING';
+    // Categorize assignments using utility function
+    const categorizedAssignments = categorizeAssignments(assignments, currentDate);
 
-      if (isPending && isWithinWindow) {
-        activeAssignments.push(assignment);
-      } else if (isPending && !isWithinWindow) {
-        expiredAssignments.push(assignment);
-      } else {
-        respondedAssignments.push(assignment);
-      }
-    });
-
-    // Auto-expire pending lots that are past window
-    if (expiredAssignments.length > 0) {
-      const expiredIds = expiredAssignments.map(a => a.id);
-      
-      // Update expired assignments
-      await supabase
-        .from('customer_assignment_table')
-        .update({
-          lot_status: 'EXPIRED',
-          responded_at: new Date().toISOString()
-        })
-        .in('id', expiredIds);
-
-      // Update inventory status back to available
-      const expiredInventoryIds = expiredAssignments.map(a => a.inventory_id);
-      await supabase
-        .from('inventory_table')
-        .update({ status: 'AVAILABLE' })
-        .in('id', expiredInventoryIds);
-
-      // Update the expired assignments in our response
-      expiredAssignments.forEach(assignment => {
-        assignment.lot_status = 'EXPIRED';
-        assignment.responded_at = new Date().toISOString();
-      });
+    // Auto-expire assignments using utility function
+    const expireResult = await autoExpireAssignments(categorizedAssignments.expired);
+    if (!expireResult.success) {
+      console.error('Auto-expiration failed:', expireResult.error);
+      // Continue with response even if auto-expiration fails
     }
 
-    // Calculate summary statistics
-    const totalAssigned = assignments.length;
-    const totalAccepted = assignments.filter(a => a.lot_status === 'ACCEPTED').length;
-    const totalRejected = assignments.filter(a => a.lot_status === 'REJECTED').length;
-    const totalPending = activeAssignments.length;
+    // Calculate summary using utility function
+    const summary = calculateAssignmentSummary(assignments, categorizedAssignments);
 
-    res.json({
-      success: true,
-      data: {
-        assignments: {
-          active: activeAssignments,
-          expired: expiredAssignments,
-          responded: respondedAssignments
-        },
-        summary: {
-          total_assigned: totalAssigned,
-          total_accepted: totalAccepted,
-          total_rejected: totalRejected,
-          total_pending: totalPending,
-          total_expired: expiredAssignments.length
-        }
-      }
+    return sendSuccessResponse(res, {
+      assignments: categorizedAssignments,
+      summary
     });
   })
 );
@@ -170,116 +83,38 @@ router.get('/lots',
  */
 router.post('/accept', 
   authenticateToken,
-  validateBody(acceptRejectSchema),
+  validateBody(routeSchemas.customerLots.acceptReject),
   asyncHandler(async (req, res) => {
     const { assignment_id } = req.body;
 
-    // Fetch assignment details
-    const { data: assignment, error: assignmentError } = await supabase
-      .from('customer_assignment_table')
-      .select(`
-        *,
-        inventory_table:inventory_id (
-          lot_number,
-          indent_number
-        )
-      `)
-      .eq('id', assignment_id)
-      .single();
-
-    if (assignmentError || !assignment) {
-      return res.status(404).json({
-        success: false,
-        message: 'Assignment not found'
-      });
+    // Get customer ID using utility function
+    const customerResult = await getCustomerId(req.user);
+    if (!customerResult.success) {
+      return sendErrorResponse(res, 404, customerResult.error);
     }
 
-    // Check if assignment belongs to the user
-    let customerId = req.user.id;
-    if (req.user.role !== 'customer') {
-      const { data: customerInfo } = await supabase
-        .from('customer_info')
-        .select('id')
-        .eq('email', req.user.email)
-        .single();
-      customerId = customerInfo?.id;
+    // Fetch assignment details using utility function
+    const assignmentResult = await fetchAssignmentDetails(assignment_id);
+    if (!assignmentResult.success) {
+      return sendErrorResponse(res, 404, assignmentResult.error);
     }
 
-    if (assignment.customer_id !== customerId) {
-      return res.status(403).json({
-        success: false,
-        message: 'Not authorized to modify this assignment'
-      });
+    // Validate assignment ownership using utility function
+    const validationResult = validateAssignmentOwnership(assignmentResult.data, customerResult.customerId);
+    if (!validationResult.success) {
+      return sendErrorResponse(res, 400, validationResult.error);
     }
 
-    // Check if within window period
-    const currentDate = new Date().toISOString().split('T')[0];
-    if (currentDate > assignment.window_end_date) {
-      return res.status(400).json({
-        success: false,
-        message: 'Assignment window has expired'
-      });
+    // Process assignment acceptance using utility function
+    const result = await processAssignmentAcceptance(assignment_id, customerResult.customerId, req.user.id);
+    if (!result.success) {
+      return handleDatabaseError(res, { message: result.error }, 'accept assignment');
     }
 
-    // Check if already responded
-    if (assignment.lot_status !== 'PENDING') {
-      return res.status(400).json({
-        success: false,
-        message: 'Assignment has already been responded to'
-      });
-    }
+    // Check if customer has accepted enough lots for the sales order
+    await checkAndTriggerConfirmation(assignmentResult.data.sales_id, req.user);
 
-    try {
-      // Update assignment status
-      const { data: updatedAssignment, error: updateError } = await supabase
-        .from('customer_assignment_table')
-        .update({
-          lot_status: 'ACCEPTED',
-          responded_by: req.user.id,
-          responded_at: new Date().toISOString()
-        })
-        .eq('id', assignment_id)
-        .select()
-        .single();
-
-      if (updateError) {
-        throw new Error(`Failed to update assignment: ${updateError.message}`);
-      }
-
-      // Update inventory status to SOLD
-      await supabase
-        .from('inventory_table')
-        .update({ status: 'SOLD', updated_at: new Date().toISOString() })
-        .eq('id', assignment.inventory_id);
-
-      // Log the acceptance
-      await supabase
-        .from('audit_log')
-        .insert({
-          table_name: 'customer_assignment_table',
-          record_id: assignment_id,
-          action: 'ACCEPTED',
-          user_id: req.user.id,
-          old_values: { lot_status: 'PENDING' },
-          new_values: { lot_status: 'ACCEPTED' }
-        });
-
-      // Check if customer has accepted enough lots for the sales order
-      await checkAndTriggerConfirmation(assignment.sales_id, req.user);
-
-      res.json({
-        success: true,
-        message: 'Lot accepted successfully',
-        data: {
-          assignment: updatedAssignment
-        }
-      });
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        message: error.message
-      });
-    }
+    return sendSuccessResponse(res, { assignment: result.data }, 'Lot accepted successfully');
   })
 );
 
@@ -290,106 +125,35 @@ router.post('/accept',
  */
 router.post('/reject', 
   authenticateToken,
-  validateBody(acceptRejectSchema),
+  validateBody(routeSchemas.customerLots.acceptReject),
   asyncHandler(async (req, res) => {
     const { assignment_id } = req.body;
 
-    // Similar validation as accept route
-    const { data: assignment, error: assignmentError } = await supabase
-      .from('customer_assignment_table')
-      .select('*')
-      .eq('id', assignment_id)
-      .single();
-
-    if (assignmentError || !assignment) {
-      return res.status(404).json({
-        success: false,
-        message: 'Assignment not found'
-      });
+    // Get customer ID using utility function
+    const customerResult = await getCustomerId(req.user);
+    if (!customerResult.success) {
+      return sendErrorResponse(res, 404, customerResult.error);
     }
 
-    // Authorization check (similar to accept)
-    let customerId = req.user.id;
-    if (req.user.role !== 'customer') {
-      const { data: customerInfo } = await supabase
-        .from('customer_info')
-        .select('id')
-        .eq('email', req.user.email)
-        .single();
-      customerId = customerInfo?.id;
+    // Fetch assignment details using utility function
+    const assignmentResult = await fetchAssignmentDetails(assignment_id);
+    if (!assignmentResult.success) {
+      return sendErrorResponse(res, 404, assignmentResult.error);
     }
 
-    if (assignment.customer_id !== customerId) {
-      return res.status(403).json({
-        success: false,
-        message: 'Not authorized to modify this assignment'
-      });
+    // Validate assignment ownership using utility function
+    const validationResult = validateAssignmentOwnership(assignmentResult.data, customerResult.customerId);
+    if (!validationResult.success) {
+      return sendErrorResponse(res, 400, validationResult.error);
     }
 
-    // Window and status checks
-    const currentDate = new Date().toISOString().split('T')[0];
-    if (currentDate > assignment.window_end_date) {
-      return res.status(400).json({
-        success: false,
-        message: 'Assignment window has expired'
-      });
+    // Process assignment rejection using utility function
+    const result = await processAssignmentRejection(assignment_id, customerResult.customerId, req.user.id);
+    if (!result.success) {
+      return handleDatabaseError(res, { message: result.error }, 'reject assignment');
     }
 
-    if (assignment.lot_status !== 'PENDING') {
-      return res.status(400).json({
-        success: false,
-        message: 'Assignment has already been responded to'
-      });
-    }
-
-    try {
-      // Update assignment status
-      const { data: updatedAssignment, error: updateError } = await supabase
-        .from('customer_assignment_table')
-        .update({
-          lot_status: 'REJECTED',
-          responded_by: req.user.id,
-          responded_at: new Date().toISOString()
-        })
-        .eq('id', assignment_id)
-        .select()
-        .single();
-
-      if (updateError) {
-        throw new Error(`Failed to update assignment: ${updateError.message}`);
-      }
-
-      // Update inventory status back to AVAILABLE
-      await supabase
-        .from('inventory_table')
-        .update({ status: 'AVAILABLE', updated_at: new Date().toISOString() })
-        .eq('id', assignment.inventory_id);
-
-      // Log the rejection
-      await supabase
-        .from('audit_log')
-        .insert({
-          table_name: 'customer_assignment_table',
-          record_id: assignment_id,
-          action: 'REJECTED',
-          user_id: req.user.id,
-          old_values: { lot_status: 'PENDING' },
-          new_values: { lot_status: 'REJECTED' }
-        });
-
-      res.json({
-        success: true,
-        message: 'Lot rejected successfully',
-        data: {
-          assignment: updatedAssignment
-        }
-      });
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        message: error.message
-      });
-    }
+    return sendSuccessResponse(res, { assignment: result.data }, 'Lot rejected successfully');
   })
 );
 
@@ -401,21 +165,14 @@ router.post('/reject',
 router.post('/admin/override', 
   authenticateToken,
   authorizeRoles('admin'),
-  validateBody(adminOverrideSchema),
+  validateBody(routeSchemas.customerLots.adminOverride),
   asyncHandler(async (req, res) => {
     const { assignment_id, action, notes } = req.body;
 
-    const { data: assignment, error: assignmentError } = await supabase
-      .from('customer_assignment_table')
-      .select('*')
-      .eq('id', assignment_id)
-      .single();
-
-    if (assignmentError || !assignment) {
-      return res.status(404).json({
-        success: false,
-        message: 'Assignment not found'
-      });
+    // Fetch assignment details using utility function
+    const assignmentResult = await fetchAssignmentDetails(assignment_id);
+    if (!assignmentResult.success) {
+      return sendErrorResponse(res, 404, assignmentResult.error);
     }
 
     try {
@@ -442,7 +199,7 @@ router.post('/admin/override',
       await supabase
         .from('inventory_table')
         .update({ status: inventoryStatus, updated_at: new Date().toISOString() })
-        .eq('id', assignment.inventory_id);
+        .eq('id', assignmentResult.data.inventory_id);
 
       // Log admin override
       await supabase
@@ -452,104 +209,26 @@ router.post('/admin/override',
           record_id: assignment_id,
           action: 'ADMIN_OVERRIDE',
           user_id: req.user.id,
-          old_values: { lot_status: assignment.lot_status },
+          old_values: { lot_status: assignmentResult.data.lot_status },
           new_values: { lot_status: newStatus, notes, admin_action: action }
         });
 
       // Check for confirmation if accepted
       if (action === 'accept') {
-        await checkAndTriggerConfirmation(assignment.sales_id, req.user);
+        await checkAndTriggerConfirmation(assignmentResult.data.sales_id, req.user);
       }
 
-      res.json({
-        success: true,
-        message: `Assignment ${action}ed by admin successfully`,
-        data: {
-          assignment: updatedAssignment,
-          admin_notes: notes
-        }
-      });
+      return sendSuccessResponse(res, {
+        assignment: updatedAssignment,
+        admin_notes: notes
+      }, `Assignment ${action}ed by admin successfully`);
     } catch (error) {
-      res.status(500).json({
-        success: false,
-        message: error.message
-      });
+      return handleDatabaseError(res, { message: error.message }, 'admin override');
     }
   })
 );
 
-/**
- * Helper function to check if enough lots are accepted and trigger confirmation
- */
-async function checkAndTriggerConfirmation(salesId, user) {
-  try {
-    // Get sales configuration to check required quantity
-    const { data: salesInfo, error: salesError } = await supabase
-      .from('sales_table')
-      .select(`
-        *,
-        sales_configuration:sales_config_id (
-          requested_quantity,
-          customer_info:customer_id (*),
-          broker_info:broker_id (*)
-        )
-      `)
-      .eq('id', salesId)
-      .single();
 
-    if (salesError || !salesInfo) {
-      console.error('Failed to fetch sales info:', salesError);
-      return;
-    }
-
-    // Count accepted lots for this sales order
-    const { data: acceptedLots, error: countError } = await supabase
-      .from('customer_assignment_table')
-      .select('id')
-      .eq('sales_id', salesId)
-      .eq('lot_status', 'ACCEPTED');
-
-    if (countError) {
-      console.error('Failed to count accepted lots:', countError);
-      return;
-    }
-
-    const acceptedCount = acceptedLots.length;
-    const requiredQuantity = salesInfo.sales_configuration.requested_quantity;
-
-    // If enough lots are accepted, trigger confirmation
-    if (acceptedCount >= requiredQuantity) {
-      // Trigger n8n webhook for confirmation
-      const webhookUrl = `${process.env.N8N_BASE_URL}${process.env.N8N_LOT_ACCEPTANCE_CONFIRMATION_WEBHOOK}`;
-      
-      await axios.post(webhookUrl, {
-        sales_id: salesId,
-        customer: salesInfo.sales_configuration.customer_info,
-        broker: salesInfo.sales_configuration.broker_info,
-        accepted_lots: acceptedCount,
-        required_quantity: requiredQuantity,
-        confirmed_by: user
-      });
-
-      // Log confirmation trigger
-      await supabase
-        .from('audit_log')
-        .insert({
-          table_name: 'sales_table',
-          record_id: salesId,
-          action: 'CONFIRMATION_SENT',
-          user_id: user.id,
-          new_values: {
-            accepted_lots: acceptedCount,
-            required_quantity: requiredQuantity,
-            confirmation_triggered: true
-          }
-        });
-    }
-  } catch (error) {
-    console.error('Error in checkAndTriggerConfirmation:', error);
-  }
-}
 
 /**
  * @route   GET /api/customer/assignments/stats
@@ -575,19 +254,12 @@ router.get('/assignments/stats',
       });
 
     if (error) {
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch statistics',
-        error: error.message
-      });
+      return handleDatabaseError(res, error, 'fetch statistics');
     }
 
-    res.json({
-      success: true,
-      data: {
-        assignment_stats: stats,
-        generated_at: new Date().toISOString()
-      }
+    return sendSuccessResponse(res, {
+      assignment_stats: stats,
+      generated_at: new Date().toISOString()
     });
   })
 );
@@ -602,19 +274,20 @@ router.post('/reminder-log',
   authorizeRoles('admin', 'n8n'), // 'n8n' is a service user/role if you have it
   asyncHandler(async (req, res) => {
     const { assignment_id, customer_id, sales_id, notes } = req.body;
-    try {
-      await supabase.from('audit_log').insert({
-        table_name: 'customer_assignment_table',
-        record_id: assignment_id,
-        action: 'REMINDER_SENT',
-        user_id: req.user.id,
-        new_values: { customer_id, sales_id, notes }
-      });
-      res.json({ success: true, message: 'Reminder log created' });
-    } catch (error) {
-      console.error('Failed to log reminder:', error);
-      res.status(500).json({ success: false, message: 'Failed to log reminder', error: error.message });
+    
+    const { error } = await supabase.from('audit_log').insert({
+      table_name: 'customer_assignment_table',
+      record_id: assignment_id,
+      action: 'REMINDER_SENT',
+      user_id: req.user.id,
+      new_values: { customer_id, sales_id, notes }
+    });
+    
+    if (error) {
+      return handleDatabaseError(res, error, 'log reminder');
     }
+    
+    return sendSuccessResponse(res, null, 'Reminder log created');
   })
 );
 
@@ -629,34 +302,35 @@ router.post('/manual-reminder',
   asyncHandler(async (req, res) => {
     const { assignment_ids } = req.body; // array of assignment IDs
     if (!Array.isArray(assignment_ids) || assignment_ids.length === 0) {
-      return res.status(400).json({ success: false, message: 'assignment_ids must be a non-empty array' });
+      return sendErrorResponse(res, 400, 'assignment_ids must be a non-empty array');
     }
+    
+    // Fetch assignment details
+    const { data: assignments, error: fetchError } = await supabase
+      .from('customer_assignment_table')
+      .select('*')
+      .in('id', assignment_ids);
+      
+    if (fetchError) {
+      return handleDatabaseError(res, fetchError, 'fetch assignments');
+    }
+    
+    // Build webhook URL (assume N8N_LOT_REMINDER_WEBHOOK is set)
+    if (!process.env.N8N_LOT_REMINDER_WEBHOOK) {
+      return sendErrorResponse(res, 500, 'n8n lot reminder webhook URL is not configured in environment variables');
+    }
+    
+    const webhookUrl = `${process.env.N8N_BASE_URL}${process.env.N8N_LOT_REMINDER_WEBHOOK}`;
+    
+    // Post to n8n webhook
     try {
-      // Fetch assignment details
-      const { data: assignments, error: fetchError } = await supabase
-        .from('customer_assignment_table')
-        .select('*')
-        .in('id', assignment_ids);
-      if (fetchError) {
-        throw new Error('Failed to fetch assignments: ' + fetchError.message);
-      }
-      // Build webhook URL (assume N8N_LOT_REMINDER_WEBHOOK is set)
-      if (!process.env.N8N_LOT_REMINDER_WEBHOOK) {
-        throw new Error('n8n lot reminder webhook URL is not configured in environment variables');
-      }
-      const webhookUrl = `${process.env.N8N_BASE_URL}${process.env.N8N_LOT_REMINDER_WEBHOOK}`;
-      // Post to n8n webhook
-      try {
-        await axios.post(webhookUrl, { assignments, triggered_by: req.user });
-      } catch (webhookError) {
-        console.error('n8n manual reminder webhook failed:', webhookError);
-        // Do not block main flow
-      }
-      res.json({ success: true, message: 'Manual reminder triggered', data: assignments });
-    } catch (error) {
-      console.error('Manual reminder error:', error);
-      res.status(500).json({ success: false, message: error.message });
+      await axios.post(webhookUrl, { assignments, triggered_by: req.user });
+    } catch (webhookError) {
+      console.error('n8n manual reminder webhook failed:', webhookError);
+      // Do not block main flow
     }
+    
+    return sendSuccessResponse(res, assignments, 'Manual reminder triggered');
   })
 );
 
