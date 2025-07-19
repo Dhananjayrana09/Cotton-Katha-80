@@ -13,6 +13,186 @@ const { validateBody } = require('../middleware/validation');
 
 const router = express.Router();
 
+// Utility function to calculate EMD due date excluding weekends and holidays
+function calculateEMDDueDate(allocationDate, emdDueDays = 5) {
+  const startDate = new Date(allocationDate);
+  let currentDate = new Date(startDate);
+  let businessDaysAdded = 0;
+  
+  while (businessDaysAdded < emdDueDays) {
+    currentDate.setDate(currentDate.getDate() + 1);
+    
+    // Skip weekends (Saturday = 6, Sunday = 0)
+    const dayOfWeek = currentDate.getDay();
+    if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+      // TODO: Add holiday check here when holiday calendar is available
+      // For now, we'll assume no holidays
+      businessDaysAdded++;
+    }
+  }
+  
+  return currentDate.toISOString().split('T')[0];
+}
+
+// Utility function to fetch trading configuration
+async function fetchTradingConfiguration() {
+  const { data: configs, error: configError } = await supabase
+    .from('trading_configuration')
+    .select('config_key, config_value')
+    .in('config_key', ['EMD_PERCENTAGE_LOW', 'EMD_PERCENTAGE_HIGH', 'GST_RATES', 'CANDY_RATE', 'BALE_WEIGHT', 'EMD_DUE_DAYS']);
+
+  if (configError) {
+    throw new Error(`Failed to fetch trading configuration: ${configError.message}`);
+  }
+
+  // Create config map
+  const configMap = {};
+  configs.forEach(config => {
+    configMap[config.config_key] = config.config_value;
+  });
+
+  // Default values if config is missing
+  const defaults = {
+    EMD_PERCENTAGE_LOW: { percentage: 15 },
+    EMD_PERCENTAGE_HIGH: { percentage: 25 },
+    GST_RATES: { cgst: 2.5, sgst: 2.5, igst: 5 },
+    CANDY_RATE: { base_rate: 356 },
+    BALE_WEIGHT: 170,
+    EMD_DUE_DAYS: 5
+  };
+
+  return {
+    emdLow: configMap.EMD_PERCENTAGE_LOW?.percentage || defaults.EMD_PERCENTAGE_LOW.percentage,
+    emdHigh: configMap.EMD_PERCENTAGE_HIGH?.percentage || defaults.EMD_PERCENTAGE_HIGH.percentage,
+    emdThreshold: 3000,
+    baleWeight: configMap.BALE_WEIGHT || defaults.BALE_WEIGHT,
+    emdDueDays: configMap.EMD_DUE_DAYS || defaults.EMD_DUE_DAYS,
+    gstRates: configMap.GST_RATES || defaults.GST_RATES,
+    candyRate: configMap.CANDY_RATE?.base_rate || defaults.CANDY_RATE.base_rate
+  };
+}
+
+// Utility function to fetch allocation with related data
+async function fetchAllocationWithData(indentNumber = null, allocationId = null) {
+  let query = supabase
+    .from('allocation')
+    .select(`
+      *,
+      branch_information:branch_id (
+        branch_name,
+        state,
+        zone
+      ),
+      parsed_data:parsed_data_id (
+        firm_name,
+        seller_type,
+        buyer_type,
+        firm_state
+      )
+    `);
+
+  if (indentNumber) {
+    query = query.eq('indent_number', indentNumber);
+  }
+  if (allocationId) {
+    query = query.eq('id', allocationId);
+  }
+
+  const { data: allocation, error: allocationError } = await query.single();
+
+  if (allocationError || !allocation) {
+    throw new Error('Allocation not found');
+  }
+
+  return allocation;
+}
+
+// Utility function to perform procurement calculations
+function calculateProcurement(allocation, config) {
+  const baleQty = Number(allocation.bale_quantity);
+  const otrPrice = Number(allocation.otr_price);
+  
+  // Calculate EMD Percentage based on threshold
+  const emdPercentage = baleQty <= config.emdThreshold ? config.emdLow : config.emdHigh;
+
+  // Calculate zone-specific candy rate
+  const zone = allocation.branch_information?.zone || 'West Zone';
+  const isSouthZone = zone.toLowerCase().includes('south');
+  const candyRateForZone = isSouthZone ? 48 : 47;
+  
+  // Calculate Cotton Value
+  const cottonValue = candyRateForZone * (baleQty / 100) * otrPrice;
+
+  // Calculate EMD Amount
+  const emdAmount = (cottonValue * emdPercentage) / 100;
+
+  // GST calculation based on state comparison
+  const firmState = allocation.parsed_data?.firm_state || 'Unknown';
+  const branchState = allocation.branch_information?.state || 'Unknown';
+  const isSameState = firmState.toLowerCase() === branchState.toLowerCase();
+  
+  let igstAmount = 0;
+  let cgstAmount = 0;
+  let sgstAmount = 0;
+  
+  if (isSameState) {
+    // Same state: Apply CGST@2.5% & SGST@2.5%
+    cgstAmount = (cottonValue * config.gstRates.cgst) / 100;
+    sgstAmount = (cottonValue * config.gstRates.sgst) / 100;
+  } else {
+    // Different state: Apply IGST@5%
+    igstAmount = (cottonValue * config.gstRates.igst) / 100;
+  }
+  
+  const gstAmount = igstAmount + cgstAmount + sgstAmount;
+
+  // Calculate total amount
+  const totalAmount = cottonValue + gstAmount;
+
+  // Calculate due date
+  const dueDate = calculateEMDDueDate(allocation.created_at || new Date().toISOString(), config.emdDueDays);
+
+  return {
+    baleQty,
+    otrPrice,
+    emdPercentage,
+    candyRateForZone,
+    cottonValue,
+    emdAmount,
+    igstAmount,
+    cgstAmount,
+    sgstAmount,
+    gstAmount,
+    totalAmount,
+    dueDate,
+    zone: allocation.branch_information?.zone || 'Unknown'
+  };
+}
+
+// Utility function to create procurement data object
+function createProcurementData(allocation, calculations, createdBy) {
+  return {
+    indent_number: allocation.indent_number,
+    allocation_id: allocation.id,
+    firm_name: allocation.parsed_data?.firm_name || 'Unknown',
+    bale_quantity: calculations.baleQty,
+    candy_rate: calculations.candyRateForZone,
+    otr_price: calculations.otrPrice,
+    cotton_value: calculations.cottonValue,
+    emd_amount: calculations.emdAmount,
+    emd_percentage: calculations.emdPercentage,
+    gst_amount: calculations.gstAmount,
+    igst_amount: calculations.igstAmount,
+    cgst_amount: calculations.cgstAmount,
+    sgst_amount: calculations.sgstAmount,
+    total_amount: calculations.totalAmount,
+    transaction_type: 'EMD',
+    due_date: calculations.dueDate,
+    created_by: createdBy,
+    zone: calculations.zone
+  };
+}
+
 // Validation schemas
 const calculateSchema = Joi.object({
   indent_number: Joi.string().required()
@@ -40,7 +220,8 @@ router.post('/process-all-allocations',
         parsed_data:parsed_data_id (
           firm_name,
           seller_type,
-          buyer_type
+          buyer_type,
+          firm_state
         )
       `)
       .not('allocation_status', 'eq', 'cancelled');
@@ -72,42 +253,16 @@ router.post('/process-all-allocations',
     }
 
     // Fetch trading configuration
-    const { data: configs, error: configError } = await supabase
-      .from('trading_configuration')
-      .select('config_key, config_value')
-      .in('config_key', ['EMD_PERCENTAGE_LOW', 'EMD_PERCENTAGE_HIGH', 'GST_RATES', 'CANDY_RATE', 'BALE_WEIGHT', 'EMD_DUE_DAYS']);
-
-    if (configError) {
+    let config;
+    try {
+      config = await fetchTradingConfiguration();
+    } catch (error) {
       return res.status(500).json({
         success: false,
         message: 'Failed to fetch trading configuration',
-        error: configError.message
+        error: error.message
       });
     }
-
-    // Create config map
-    const configMap = {};
-    configs.forEach(config => {
-      configMap[config.config_key] = config.config_value;
-    });
-
-    // Default values if config is missing
-    const defaults = {
-      EMD_PERCENTAGE_LOW: { percentage: 10 },
-      EMD_PERCENTAGE_HIGH: { percentage: 25 },
-      GST_RATES: { cgst: 2.5, sgst: 2.5, igst: 5 },
-      CANDY_RATE: { base_rate: 356 },
-      BALE_WEIGHT: 170,
-      EMD_DUE_DAYS: 5
-    };
-
-    const emdLow = configMap.EMD_PERCENTAGE_LOW?.percentage || defaults.EMD_PERCENTAGE_LOW.percentage;
-    const emdHigh = configMap.EMD_PERCENTAGE_HIGH?.percentage || defaults.EMD_PERCENTAGE_HIGH.percentage;
-    const emdThreshold = 3000; // From the diagram
-    const baleWeight = configMap.BALE_WEIGHT || defaults.BALE_WEIGHT;
-    const emdDueDays = configMap.EMD_DUE_DAYS || defaults.EMD_DUE_DAYS;
-    const gstRates = configMap.GST_RATES || defaults.GST_RATES;
-    const candyRate = configMap.CANDY_RATE?.base_rate || defaults.CANDY_RATE.base_rate;
 
     const processedRecords = [];
     const errors = [];
@@ -115,59 +270,11 @@ router.post('/process-all-allocations',
     // Process each allocation
     for (const allocation of allocationsToProcess) {
       try {
-        const baleQty = Number(allocation.bale_quantity);
-        const otrPrice = Number(allocation.otr_price);
+        // Perform calculations using utility function
+        const calculations = calculateProcurement(allocation, config);
         
-        // Calculate EMD Percentage based on threshold
-        const emdPercentage = baleQty <= emdThreshold ? emdLow : emdHigh;
-
-        // Calculate Cotton Value (Candy Rate * Bales/100 * Bid Price)
-        const cottonValue = candyRate * (baleQty / 100) * otrPrice;
-
-        // Calculate EMD Amount
-        const emdAmount = (cottonValue * emdPercentage) / 100;
-
-        // Calculate GST based on zone
-        const zone = allocation.branch_information?.zone || 'West Zone';
-        const isSouthZone = zone.toLowerCase().includes('south');
-        const candyRateForZone = isSouthZone ? 40 : 47; // From the diagram
-        
-        // Recalculate cotton value with zone-specific candy rate
-        const cottonValueWithZone = candyRateForZone * (baleQty / 100) * otrPrice;
-        
-        // GST calculation (simplified - using IGST for all cases as per diagram)
-        const igstAmount = (cottonValueWithZone * gstRates.igst) / 100;
-        const cgstAmount = 0;
-        const sgstAmount = 0;
-        const gstAmount = igstAmount;
-
-        // Calculate total amount
-        const totalAmount = cottonValueWithZone + gstAmount;
-
-        // Calculate due date
-        const dueDate = new Date();
-        dueDate.setDate(dueDate.getDate() + emdDueDays);
-
-        const procurementData = {
-          indent_number: allocation.indent_number,
-          allocation_id: allocation.id,
-          firm_name: allocation.parsed_data?.firm_name || 'Unknown',
-          bale_quantity: baleQty,
-          candy_rate: candyRateForZone,
-          otr_price: otrPrice,
-          cotton_value: cottonValueWithZone,
-          emd_amount: emdAmount,
-          emd_percentage: emdPercentage,
-          gst_amount: gstAmount,
-          igst_amount: igstAmount,
-          cgst_amount: cgstAmount,
-          sgst_amount: sgstAmount,
-          total_amount: totalAmount,
-          transaction_type: 'EMD',
-          due_date: dueDate.toISOString().split('T')[0],
-          created_by: req.user.id,
-          zone: allocation.branch_information?.zone || 'Unknown'
-        };
+        // Create procurement data using utility function
+        const procurementData = createProcurementData(allocation, calculations, req.user.id);
 
         const { data: procurement, error: procurementError } = await supabase
           .from('procurement_dump')
@@ -229,26 +336,11 @@ router.post('/calculate',
   asyncHandler(async (req, res) => {
     const { indent_number } = req.body;
 
-    // Fetch allocation data
-    const { data: allocation, error: allocationError } = await supabase
-      .from('allocation')
-      .select(`
-        *,
-        branch_information:branch_id (
-          branch_name,
-          state,
-          zone
-        ),
-        parsed_data:parsed_data_id (
-          firm_name,
-          seller_type,
-          buyer_type
-        )
-      `)
-      .eq('indent_number', indent_number)
-      .single();
-
-    if (allocationError || !allocation) {
+    // Fetch allocation data using utility function
+    let allocation;
+    try {
+      allocation = await fetchAllocationWithData(indent_number);
+    } catch (error) {
       return res.status(404).json({
         success: false,
         message: 'Allocation not found for the given indent number'
@@ -269,93 +361,23 @@ router.post('/calculate',
       });
     }
 
-    // Fetch trading configuration from DB
-    const { data: configs, error: configError } = await supabase
-      .from('trading_configuration')
-      .select('config_key, config_value')
-      .in('config_key', ['EMD_PERCENTAGE_LOW', 'EMD_PERCENTAGE_HIGH', 'GST_RATES', 'CANDY_RATE', 'BALE_WEIGHT', 'EMD_DUE_DAYS']);
-
-    if (configError) {
+    // Fetch trading configuration using utility function
+    let config;
+    try {
+      config = await fetchTradingConfiguration();
+    } catch (error) {
       return res.status(500).json({
         success: false,
         message: 'Failed to fetch trading configuration',
-        error: configError.message
+        error: error.message
       });
     }
 
-    // Create config map
-    const configMap = {};
-    configs.forEach(config => {
-      configMap[config.config_key] = config.config_value;
-    });
-
-    // Default values if config is missing
-    const defaults = {
-      EMD_PERCENTAGE_LOW: { percentage: 10 },
-      EMD_PERCENTAGE_HIGH: { percentage: 25 },
-      GST_RATES: { cgst: 2.5, sgst: 2.5, igst: 5 },
-      CANDY_RATE: { base_rate: 356 },
-      BALE_WEIGHT: 170,
-      EMD_DUE_DAYS: 5
-    };
-
-    const emdLow = configMap.EMD_PERCENTAGE_LOW?.percentage || defaults.EMD_PERCENTAGE_LOW.percentage;
-    const emdHigh = configMap.EMD_PERCENTAGE_HIGH?.percentage || defaults.EMD_PERCENTAGE_HIGH.percentage;
-    const emdThreshold = 3000; // From the diagram
-    const baleWeight = configMap.BALE_WEIGHT || defaults.BALE_WEIGHT;
-    const emdDueDays = configMap.EMD_DUE_DAYS || defaults.EMD_DUE_DAYS;
-    const gstRates = configMap.GST_RATES || defaults.GST_RATES;
-    const candyRate = configMap.CANDY_RATE?.base_rate || defaults.CANDY_RATE.base_rate;
-
-    // Calculate EMD Percentage based on threshold
-    const baleQty = Number(allocation.bale_quantity);
-    const emdPercentage = baleQty <= emdThreshold ? emdLow : emdHigh;
-
-    // Calculate Cotton Value (Candy Rate * Bales/100 * Bid Price)
-    const otrPrice = Number(allocation.otr_price);
-    const zone = allocation.branch_information?.zone || 'West Zone';
-    const isSouthZone = zone.toLowerCase().includes('south');
-    const candyRateForZone = isSouthZone ? 40 : 47; // From the diagram
+    // Perform calculations using utility function
+    const calculations = calculateProcurement(allocation, config);
     
-    const cottonValue = candyRateForZone * (baleQty / 100) * otrPrice;
-
-    // Calculate EMD Amount
-    const emdAmount = (cottonValue * emdPercentage) / 100;
-
-    // Calculate GST (simplified - using IGST for all cases as per diagram)
-    const igstAmount = (cottonValue * gstRates.igst) / 100;
-    const cgstAmount = 0;
-    const sgstAmount = 0;
-    const gstAmount = igstAmount;
-
-    // Calculate total amount
-    const totalAmount = cottonValue + gstAmount;
-
-    // Calculate due date
-    const dueDate = new Date();
-    dueDate.setDate(dueDate.getDate() + emdDueDays);
-
-    // Save to procurement_dump
-    const procurementData = {
-      indent_number,
-      allocation_id: allocation.id,
-      firm_name: allocation.parsed_data?.firm_name || 'Unknown',
-      bale_quantity: baleQty,
-      candy_rate: candyRateForZone,
-      otr_price: otrPrice,
-      cotton_value: cottonValue,
-      emd_amount: emdAmount,
-      emd_percentage: emdPercentage,
-      gst_amount: gstAmount,
-      igst_amount: igstAmount,
-      cgst_amount: cgstAmount,
-      sgst_amount: sgstAmount,
-      total_amount: totalAmount,
-      transaction_type: 'EMD',
-      due_date: dueDate.toISOString().split('T')[0],
-      created_by: req.user.id,
-      zone: allocation.branch_information?.zone || 'Unknown'
-    };
+    // Create procurement data using utility function
+    const procurementData = createProcurementData(allocation, calculations, req.user.id);
 
     const { data: procurement, error: procurementError } = await supabase
       .from('procurement_dump')
@@ -389,16 +411,16 @@ router.post('/calculate',
         procurement: {
           ...procurement,
           breakdown: {
-            cotton_value: cottonValue,
-            emd_amount: emdAmount,
-            emd_percentage: emdPercentage,
+            cotton_value: calculations.cottonValue,
+            emd_amount: calculations.emdAmount,
+            emd_percentage: calculations.emdPercentage,
             gst_breakdown: {
-              total_gst: gstAmount,
-              igst: igstAmount,
-              cgst: cgstAmount,
-              sgst: sgstAmount
+              total_gst: calculations.gstAmount,
+              igst: calculations.igstAmount,
+              cgst: calculations.cgstAmount,
+              sgst: calculations.sgstAmount
             },
-            total_amount: totalAmount
+            total_amount: calculations.totalAmount
           }
         }
       }
@@ -542,97 +564,31 @@ router.post('/webhook/new-allocation',
       });
     }
 
-    // Fetch allocation data
-    const { data: allocation, error: allocationError } = await supabase
-      .from('allocation')
-      .select(`
-        *,
-        branch_information:branch_id (
-          branch_name,
-          state,
-          zone
-        ),
-        parsed_data:parsed_data_id (
-          firm_name,
-          seller_type,
-          buyer_type
-        )
-      `)
-      .eq('id', allocation_id)
-      .single();
-
-    if (allocationError || !allocation) {
+    // Fetch allocation data using utility function
+    let allocation;
+    try {
+      allocation = await fetchAllocationWithData(null, allocation_id);
+    } catch (error) {
       return res.status(404).json({
         success: false,
         message: 'Allocation not found'
       });
     }
 
-    // Fetch trading configuration
-    const { data: configs, error: configError } = await supabase
-      .from('trading_configuration')
-      .select('config_key, config_value')
-      .in('config_key', ['EMD_PERCENTAGE_LOW', 'EMD_PERCENTAGE_HIGH', 'GST_RATES', 'CANDY_RATE', 'BALE_WEIGHT', 'EMD_DUE_DAYS']);
-
-    if (configError) {
+    // Fetch trading configuration using utility function
+    let config;
+    try {
+      config = await fetchTradingConfiguration();
+    } catch (error) {
       return res.status(500).json({
         success: false,
         message: 'Failed to fetch trading configuration',
-        error: configError.message
+        error: error.message
       });
     }
 
-    // Create config map
-    const configMap = {};
-    configs.forEach(config => {
-      configMap[config.config_key] = config.config_value;
-    });
-
-    // Default values if config is missing
-    const defaults = {
-      EMD_PERCENTAGE_LOW: { percentage: 10 },
-      EMD_PERCENTAGE_HIGH: { percentage: 25 },
-      GST_RATES: { cgst: 2.5, sgst: 2.5, igst: 5 },
-      CANDY_RATE: { base_rate: 356 },
-      BALE_WEIGHT: 170,
-      EMD_DUE_DAYS: 5
-    };
-
-    const emdLow = configMap.EMD_PERCENTAGE_LOW?.percentage || defaults.EMD_PERCENTAGE_LOW.percentage;
-    const emdHigh = configMap.EMD_PERCENTAGE_HIGH?.percentage || defaults.EMD_PERCENTAGE_HIGH.percentage;
-    const emdThreshold = 3000; // From the diagram
-    const baleWeight = configMap.BALE_WEIGHT || defaults.BALE_WEIGHT;
-    const emdDueDays = configMap.EMD_DUE_DAYS || defaults.EMD_DUE_DAYS;
-    const gstRates = configMap.GST_RATES || defaults.GST_RATES;
-    const candyRate = configMap.CANDY_RATE?.base_rate || defaults.CANDY_RATE.base_rate;
-
-    // Calculate EMD Percentage based on threshold
-    const baleQty = Number(allocation.bale_quantity);
-    const emdPercentage = baleQty <= emdThreshold ? emdLow : emdHigh;
-
-    // Calculate Cotton Value (Candy Rate * Bales/100 * Bid Price)
-    const otrPrice = Number(allocation.otr_price);
-    const zone = allocation.branch_information?.zone || 'West Zone';
-    const isSouthZone = zone.toLowerCase().includes('south');
-    const candyRateForZone = isSouthZone ? 40 : 47; // From the diagram
-    
-    const cottonValue = candyRateForZone * (baleQty / 100) * otrPrice;
-
-    // Calculate EMD Amount
-    const emdAmount = (cottonValue * emdPercentage) / 100;
-
-    // Calculate GST (simplified - using IGST for all cases as per diagram)
-    const igstAmount = (cottonValue * gstRates.igst) / 100;
-    const cgstAmount = 0;
-    const sgstAmount = 0;
-    const gstAmount = igstAmount;
-
-    // Calculate total amount
-    const totalAmount = cottonValue + gstAmount;
-
-    // Calculate due date
-    const dueDate = new Date();
-    dueDate.setDate(dueDate.getDate() + emdDueDays);
+    // Perform calculations using utility function
+    const calculations = calculateProcurement(allocation, config);
 
     // Handle created_by field - use default admin user if not a valid UUID
     let createdBy = '550e8400-e29b-41d4-a716-446655440000'; // Default admin user
@@ -644,26 +600,8 @@ router.post('/webhook/new-allocation',
       }
     }
 
-    const procurementData = {
-      indent_number: allocation.indent_number,
-      allocation_id: allocation.id,
-      firm_name: allocation.parsed_data?.firm_name || 'Unknown',
-      bale_quantity: baleQty,
-      candy_rate: candyRateForZone,
-      otr_price: otrPrice,
-      cotton_value: cottonValue,
-      emd_amount: emdAmount,
-      emd_percentage: emdPercentage,
-      gst_amount: gstAmount,
-      igst_amount: igstAmount,
-      cgst_amount: cgstAmount,
-      sgst_amount: sgstAmount,
-      total_amount: totalAmount,
-      transaction_type: 'EMD',
-      due_date: dueDate.toISOString().split('T')[0],
-      created_by: createdBy,
-      zone: allocation.branch_information?.zone || 'Unknown'
-    };
+    // Create procurement data using utility function
+    const procurementData = createProcurementData(allocation, calculations, createdBy);
 
     const { data: procurement, error: procurementError } = await supabase
       .from('procurement_dump')

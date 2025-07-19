@@ -445,12 +445,12 @@ router.get('/procurement/config', authenticateToken, asyncHandler(async (req, re
   const config = {
     bale_weight: 170, // kg
     cotton_value_multiplier: 1,
-    emd_percentage_threshold: 2000,
-    emd_percentage_low: 10,
-    emd_percentage_high: 20,
-    gst_same_state: { cgst: 9, sgst: 9 },
-    gst_diff_state: { igst: 18 },
-    emd_due_days: 3
+    emd_percentage_threshold: 3000, // Fixed: Changed from 2000 to 3000
+    emd_percentage_low: 15, // Fixed: Changed from 10 to 15
+    emd_percentage_high: 25, // Fixed: Changed from 20 to 25
+    gst_same_state: { cgst: 2.5, sgst: 2.5 }, // Fixed: Changed from 9 to 2.5
+    gst_diff_state: { igst: 5 }, // Fixed: Changed from 18 to 5
+    emd_due_days: 5
   };
   res.json({ data: config });
 }));
