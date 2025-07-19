@@ -97,23 +97,13 @@ router.post('/calculate',
       }
     }
 
-    // Use config values (prefer DB, fallback to hardcoded)
-    const baleWeight = Number(configMap.BALE_WEIGHT) || 170;
-    const emdDueDays = Number(configMap.EMD_DUE_DAYS) || 3;
-    const emdThreshold = Number(configMap.EMD_PERCENTAGE_THRESHOLD) || 2000;
-    const emdLow = Number(configMap.EMD_PERCENTAGE_LOW) || 10;
-    const emdHigh = Number(configMap.EMD_PERCENTAGE_HIGH) || 20;
-    const cottonValueMultiplier = Number(configMap.COTTON_VALUE_MULTIPLIER) || 1;
-    const gstSameState = configMap.GST_SAME_STATE || { cgst: 9, sgst: 9 };
-    const gstDiffState = configMap.GST_DIFF_STATE || { igst: 18 };
-
     // Calculate EMD Percentage (threshold 2000)
     const baleQty = Number(allocation.bale_quantity);
     const emdPercentage = baleQty <= emdThreshold ? emdLow : emdHigh;
 
     // Calculate Cotton Value
     const otrPrice = Number(allocation.otr_price);
-    const cottonValue = otrPrice * baleQty * baleWeight * cottonValueMultiplier;
+    const cottonValue = otrPrice * baleQty * cottonValueMultiplier;
 
     // Calculate EMD Amount
     const emdAmount = (cottonValue * emdPercentage) / 100;

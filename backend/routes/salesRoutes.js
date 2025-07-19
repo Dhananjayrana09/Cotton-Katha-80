@@ -41,14 +41,12 @@ const newOrderSchema = Joi.object({
   customer_id: Joi.string().uuid().required(),
   broker_id: Joi.string().uuid().required(),
   order_date: Joi.date().default(() => new Date()),
-  requested_quantity: Joi.number().integer().min(1).required(),
-  lifting_period: Joi.string().required(),
-  priority_branch: Joi.string().optional(),
   line_items: Joi.array().items(
     Joi.object({
       indent_number: Joi.string().required(),
-      quantity: Joi.number().integer().min(1).required(),
-      commission_rate: Joi.number().min(0).required()
+      quantity: Joi.number().integer().min(1).required(), // This is now in lots
+      broker_brokerage_per_bale: Joi.number().min(0).required(),
+      our_brokerage_per_bale: Joi.number().min(0).required()
     })
   ).min(1).required()
 });
@@ -138,9 +136,8 @@ router.post('/auto-select-lots',
       });
     }
 
-        // Calculate selection limits based on industry standard (6.12 bales per ton)
-    const balesPerTon = 1; // CHANGED FROM 6.12 to 1 for testing
-    const base = Math.ceil(requested_qty * balesPerTon);
+        // Calculate selection limits - requested_qty is already in lots
+    const base = requested_qty;
     const extra = Math.floor(base * 0.2); // 20% extra for flexibility
     const maxLimit = base + extra;
 
@@ -859,7 +856,7 @@ router.post('/new',
   authorizeRoles('admin', 'trader'),
   validateBody(newOrderSchema),
   asyncHandler(async (req, res) => {
-    const { customer_id, broker_id, order_date, requested_quantity, lifting_period, priority_branch, line_items } = req.body;
+    const { customer_id, broker_id, order_date, line_items } = req.body;
 
     // Validate customer
     const { data: customer, error: customerError } = await supabase
@@ -883,34 +880,120 @@ router.post('/new',
 
     // Validate and fetch indents for each line item
     const indentNumbers = line_items.map(item => item.indent_number);
+    
+    // Fetch indents from procurement_dump table
     const { data: indents, error: indentError } = await supabase
       .from('procurement_dump')
-      .select('*')
+      .select(`
+        *,
+        allocation:allocation_id (
+          indent_number,
+          lifting_period,
+          bale_quantity,
+          otr_price,
+          branch_name,
+          zone,
+          allocation_status,
+          parsed_data:parsed_data_id (
+            fibre_length,
+            variety
+          )
+        )
+      `)
       .in('indent_number', indentNumbers);
+    
     if (indentError) {
       return res.status(500).json({ success: false, message: 'Failed to fetch indents', error: indentError.message });
     }
+    
     if (!indents || indents.length !== line_items.length) {
       return res.status(400).json({ success: false, message: 'One or more indents are invalid' });
     }
 
+    // Validate each indent and check available quantity
+    for (let i = 0; i < line_items.length; i++) {
+      const lineItem = line_items[i];
+      const indent = indents.find(ind => ind.indent_number === lineItem.indent_number);
+      
+      if (!indent) {
+        return res.status(400).json({ 
+          success: false, 
+          message: `Indent ${lineItem.indent_number} not found in procurement table` 
+        });
+      }
+
+      // Check if indent is active
+      if (indent.allocation?.allocation_status !== 'active') {
+        return res.status(400).json({ 
+          success: false, 
+          message: `Indent ${lineItem.indent_number} is not active for sales` 
+        });
+      }
+
+      // Check available quantity (total bales in indent vs already sold)
+      const totalBalesInIndent = indent.allocation?.bale_quantity || 0;
+      
+      // Get already sold quantity for this indent
+      const { data: soldLots, error: soldError } = await supabase
+        .from('lot_selected_contract')
+        .select('quantity')
+        .eq('indent_number', lineItem.indent_number);
+      
+      if (soldError) {
+        return res.status(500).json({ 
+          success: false, 
+          message: 'Failed to check sold quantity', 
+          error: soldError.message 
+        });
+      }
+      
+      const alreadySold = soldLots?.reduce((sum, lot) => sum + (lot.quantity || 0), 0) || 0;
+      const availableBales = totalBalesInIndent - alreadySold;
+      
+      if (lineItem.quantity > availableBales) {
+        return res.status(400).json({ 
+          success: false, 
+          message: `Indent ${lineItem.indent_number} has only ${availableBales} bales available, but ${lineItem.quantity} requested` 
+        });
+      }
+    }
+
+    // Get lifting period from first indent (they should all be the same for a single order)
+    const lifting_period = indents[0]?.allocation?.lifting_period;
+    if (!lifting_period) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Lifting period not found for the indent' 
+      });
+    }
+
     // Build line specs (for filtering lots later)
     const lineSpecs = {
-      variety: indents[0].variety, // Example: use first indent's specs
-      fibre_length: indents[0].fibre_length
+      variety: indents[0]?.allocation?.parsed_data?.variety || 'Any',
+      fibre_length: indents[0]?.allocation?.parsed_data?.fibre_length || 'Any'
     };
 
-    // Create sales configuration
+    // Calculate total requested quantity from line items
+    const totalRequestedQuantity = line_items.reduce((sum, item) => sum + item.quantity, 0);
+
+    // Create sales configuration with line items stored in line_specs
     const { data: salesConfig, error: configError } = await supabase
       .from('sales_configuration')
       .insert({
         customer_id,
         broker_id,
         order_date,
-        requested_quantity,
+        requested_quantity: totalRequestedQuantity,
         lifting_period,
-        priority_branch,
-        line_specs: lineSpecs,
+        line_specs: {
+          ...lineSpecs,
+          line_items: line_items.map(item => ({
+            indent_number: item.indent_number,
+            quantity: item.quantity,
+            broker_brokerage_per_bale: item.broker_brokerage_per_bale,
+            our_brokerage_per_bale: item.our_brokerage_per_bale
+          }))
+        },
         status: 'pending',
         created_by: req.user.id,
         created_at: new Date().toISOString(),
@@ -922,16 +1005,13 @@ router.post('/new',
       return res.status(500).json({ success: false, message: 'Failed to create sales configuration', error: configError.message });
     }
 
-    // Optionally, store line items in a separate table if needed
-    // ...
-
     // Log creation
     await supabase.from('audit_log').insert({
       table_name: 'sales_configuration',
       record_id: salesConfig.id,
       action: 'SALES_ORDER_CREATED',
       user_id: req.user.id,
-      new_values: { customer_id, broker_id, requested_quantity, lifting_period, priority_branch, line_items }
+      new_values: { customer_id, broker_id, requested_quantity: totalRequestedQuantity, line_items }
     });
 
     // Trigger n8n webhook for contract PDF/email
@@ -943,9 +1023,7 @@ router.post('/new',
         broker,
         line_items,
         order_date,
-        requested_quantity,
-        lifting_period,
-        priority_branch,
+        requested_quantity: totalRequestedQuantity,
         created_by: req.user,
       });
       // Log CONTRACT_SENT
@@ -988,5 +1066,100 @@ router.get('/broker-info', authenticateToken, asyncHandler(async (req, res) => {
   if (error) return res.status(500).json({ success: false, message: 'Failed to fetch brokers', error: error.message });
   res.json({ data: { brokers: data } });
 }));
+
+/**
+ * @route   POST /api/sales/validate-indent
+ * @desc    Validate indent number and fetch allocation details
+ * @access  Private
+ */
+router.post('/validate-indent', 
+  authenticateToken,
+  validateBody(Joi.object({
+    indent_number: Joi.string().required()
+  })),
+  asyncHandler(async (req, res) => {
+    const { indent_number } = req.body;
+
+    // Fetch indent from procurement_dump table with allocation details
+    const { data: indent, error: indentError } = await supabase
+      .from('procurement_dump')
+      .select(`
+        *,
+        allocation:allocation_id (
+          indent_number,
+          lifting_period,
+          bale_quantity,
+          otr_price,
+          branch_name,
+          zone,
+          allocation_status,
+          parsed_data:parsed_data_id (
+            fibre_length,
+            variety
+          )
+        )
+      `)
+      .eq('indent_number', indent_number)
+      .single();
+
+    if (indentError || !indent) {
+      return res.status(404).json({
+        success: false,
+        message: 'Indent not found in procurement table'
+      });
+    }
+
+    // Check if indent is active
+    if (indent.allocation?.allocation_status !== 'active') {
+      return res.status(400).json({
+        success: false,
+        message: 'Indent is not active for sales'
+      });
+    }
+
+    // Get already sold quantity for this indent
+    const { data: soldLots, error: soldError } = await supabase
+      .from('lot_selected_contract')
+      .select('quantity')
+      .eq('indent_number', indent_number);
+    
+    if (soldError) {
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to check sold quantity',
+        error: soldError.message
+      });
+    }
+    
+    const alreadySold = soldLots?.reduce((sum, lot) => sum + (lot.quantity || 0), 0) || 0;
+    const totalBales = indent.allocation?.bale_quantity || 0;
+    const availableBales = totalBales - alreadySold;
+
+    if (availableBales <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No units available for this indent'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        indent: {
+          indent_number: indent.indent_number,
+          bales_quantity: totalBales,
+          available_bales: availableBales,
+          centre_name: indent.allocation?.branch_name || 'N/A',
+          branch: indent.allocation?.branch_name || 'N/A',
+          date: indent.created_at,
+          lifting_period: indent.allocation?.lifting_period,
+          fibre_length: indent.allocation?.parsed_data?.fibre_length || 'N/A',
+          variety: indent.allocation?.parsed_data?.variety || 'N/A',
+          bid_price: indent.allocation?.otr_price
+        }
+      }
+    });
+  })
+);
 
 module.exports = router;

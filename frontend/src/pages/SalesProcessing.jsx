@@ -51,10 +51,13 @@ const SalesProcessing = () => {
   const [newOrder, setNewOrder] = useState({
     customer_id: '',
     broker_id: '',
-    requested_quantity: '',
-    lifting_period: '',
-    priority_branch: '',
-    line_items: [{ indent_number: '', quantity: '', commission_rate: '' }]
+    line_items: [{ 
+      indent_number: '', 
+      quantity: '', 
+      broker_brokerage_per_bale: '', 
+      our_brokerage_per_bale: '',
+      indent_details: null 
+    }]
   })
   const [creatingOrder, setCreatingOrder] = useState(false)
 
@@ -82,16 +85,99 @@ const SalesProcessing = () => {
     setNewOrder(prev => {
       const items = [...prev.line_items]
       items[idx][field] = value
+      
+      // Validate quantity doesn't exceed available bales
+      if (field === 'quantity' && items[idx].indent_details) {
+        const quantity = Number(value)
+        const available = items[idx].indent_details.available_bales
+        if (quantity > available) {
+          toast.error(`Quantity cannot exceed available bales (${available})`)
+          items[idx][field] = available.toString()
+        }
+      }
+      
       return { ...prev, line_items: items }
     })
   }
   
   const addLineItem = () => {
-    setNewOrder(prev => ({ ...prev, line_items: [...prev.line_items, { indent_number: '', quantity: '', commission_rate: '' }] }))
+    setNewOrder(prev => ({ 
+      ...prev, 
+      line_items: [...prev.line_items, { 
+        indent_number: '', 
+        quantity: '', 
+        broker_brokerage_per_bale: '', 
+        our_brokerage_per_bale: '',
+        indent_details: null 
+      }] 
+    }))
   }
   
   const removeLineItem = (idx) => {
     setNewOrder(prev => ({ ...prev, line_items: prev.line_items.filter((_, i) => i !== idx) }))
+  }
+
+  // Validate indent number and fetch details
+  const validateIndent = async (indentNumber, lineIndex) => {
+    if (!indentNumber.trim()) {
+      toast.error('Please enter an indent number')
+      return
+    }
+
+    try {
+      const response = await api.post('/sales/validate-indent', {
+        indent_number: indentNumber.trim().toUpperCase()
+      })
+      
+      const indentDetails = response.data.data.indent
+      
+      // Update line item with indent details and clear quantity if it exceeds available
+      setNewOrder(prev => {
+        const items = [...prev.line_items]
+        items[lineIndex].indent_details = indentDetails
+        
+        // Clear quantity if it exceeds available bales
+        if (Number(items[lineIndex].quantity) > indentDetails.available_bales) {
+          items[lineIndex].quantity = ''
+        }
+        
+        return { ...prev, line_items: items }
+      })
+      
+      toast.success(`Indent ${indentNumber} validated successfully`)
+    } catch (error) {
+      console.error('Error validating indent:', error)
+      const message = error.response?.data?.message || 'Failed to validate indent'
+      toast.error(message)
+      
+      // Clear indent details on error
+      setNewOrder(prev => {
+        const items = [...prev.line_items]
+        items[lineIndex].indent_details = null
+        return { ...prev, line_items: items }
+      })
+    }
+  }
+
+  // Calculate order totals
+  const calculateOrderTotals = () => {
+    let totalLots = 0
+    let totalBrokerBrokerage = 0
+    let totalOurBrokerage = 0
+    
+    newOrder.line_items.forEach(item => {
+      if (item.indent_details && item.quantity) {
+        totalLots += Number(item.quantity)
+        totalBrokerBrokerage += Number(item.quantity) * Number(item.broker_brokerage_per_bale || 0)
+        totalOurBrokerage += Number(item.quantity) * Number(item.our_brokerage_per_bale || 0)
+      }
+    })
+    
+    return {
+      totalLots,
+      totalBrokerBrokerage,
+      totalOurBrokerage
+    }
   }
 
   // Submit new order
@@ -100,7 +186,7 @@ const SalesProcessing = () => {
     setCreatingOrder(true)
     try {
       // Enhanced validation
-      if (!newOrder.customer_id || !newOrder.broker_id || !newOrder.requested_quantity || !newOrder.lifting_period || newOrder.line_items.length === 0) {
+      if (!newOrder.customer_id || !newOrder.broker_id || newOrder.line_items.length === 0) {
         toast.error('Please fill all required fields and add at least one line item')
         setCreatingOrder(false)
         return
@@ -108,10 +194,18 @@ const SalesProcessing = () => {
 
       // Validate line items
       const invalidLineItems = newOrder.line_items.filter(item => 
-        !item.indent_number || !item.quantity || !item.commission_rate
+        !item.indent_number || !item.quantity || !item.broker_brokerage_per_bale || !item.our_brokerage_per_bale || !item.indent_details
       )
       if (invalidLineItems.length > 0) {
-        toast.error('Please fill all fields in line items')
+        toast.error('Please fill all fields in line items and validate indents')
+        setCreatingOrder(false)
+        return
+      }
+
+      // Validate quantities are positive
+      const invalidQuantities = newOrder.line_items.filter(item => Number(item.quantity) <= 0)
+      if (invalidQuantities.length > 0) {
+        toast.error('All quantities must be positive')
         setCreatingOrder(false)
         return
       }
@@ -119,19 +213,25 @@ const SalesProcessing = () => {
       // POST to backend
       await api.post('/sales/new', {
         ...newOrder,
-        requested_quantity: Number(newOrder.requested_quantity),
         line_items: newOrder.line_items.map(item => ({
-          ...item,
+          indent_number: item.indent_number,
           quantity: Number(item.quantity),
-          commission_rate: Number(item.commission_rate)
+          broker_brokerage_per_bale: Number(item.broker_brokerage_per_bale),
+          our_brokerage_per_bale: Number(item.our_brokerage_per_bale)
         }))
       })
       
       toast.success('Sales order created successfully!')
       setShowNewOrderForm(false)
       setNewOrder({
-        customer_id: '', broker_id: '', requested_quantity: '', lifting_period: '', priority_branch: '',
-        line_items: [{ indent_number: '', quantity: '', commission_rate: '' }]
+        customer_id: '', broker_id: '',
+        line_items: [{ 
+          indent_number: '', 
+          quantity: '', 
+          broker_brokerage_per_bale: '', 
+          our_brokerage_per_bale: '',
+          indent_details: null 
+        }]
       })
       fetchPendingOrders()
     } catch (error) {
@@ -181,10 +281,8 @@ const SalesProcessing = () => {
 
   // Enhanced lot selection calculation
   const calculateRequiredLots = (requestedQty) => {
-    // Convert to bales: 1 ton = 6.12 bales (industry standard)
-    const balesPerTon = 6.12
-    const requiredBales = Math.ceil(requestedQty * balesPerTon)
-    return requiredBales
+    // requestedQty is already in lots, no conversion needed
+    return requestedQty
   }
 
   // Select order for processing
@@ -193,13 +291,13 @@ const SalesProcessing = () => {
       setSelectedOrder(order)
       setMode('processing')
       
-      // Calculate required lots based on industry standard
-      const requiredBales = calculateRequiredLots(order.requested_quantity)
+      // Calculate required lots (already in lots)
+      const requiredLots = calculateRequiredLots(order.requested_quantity)
       
       // Auto-select lots with enhanced logic
       const response = await api.post('/sales/auto-select-lots', {
         sales_config_id: order.id,
-        requested_qty: requiredBales
+        requested_qty: requiredLots
       })
       
       if (response.data.data.out_of_stock) {
@@ -213,7 +311,7 @@ const SalesProcessing = () => {
       setManualSelection(response.data.data.auto_selected.map(lot => lot.id))
       
       // Calculate initial stats
-      updateSelectionStats(response.data.data.auto_selected, requiredBales, order)
+      updateSelectionStats(response.data.data.auto_selected, requiredLots, order)
       
       setMode('selection')
     } catch (error) {
@@ -225,21 +323,21 @@ const SalesProcessing = () => {
   }
 
   // Update selection statistics
-  const updateSelectionStats = (selectedLots, requiredBales, order) => {
+  const updateSelectionStats = (selectedLots, requiredLots, order) => {
     const totalValue = selectedLots.reduce((sum, lot) => sum + (lot.bid_price || 0), 0)
     const brokerCommission = (totalValue * (order.broker_info?.commission_rate || 0)) / 100
     const netAmount = totalValue - brokerCommission
-    const insufficientLots = selectedLots.length < requiredBales
+    const insufficientLots = selectedLots.length < requiredLots
     
     let warningMessage = ''
     if (insufficientLots) {
-      warningMessage = `Insufficient lots. Required: ${requiredBales}, Selected: ${selectedLots.length}`
-    } else if (selectedLots.length > requiredBales * 1.2) {
-      warningMessage = `Over-selected lots. Required: ${requiredBales}, Selected: ${selectedLots.length}`
+      warningMessage = `Insufficient lots. Required: ${requiredLots}, Selected: ${selectedLots.length}`
+    } else if (selectedLots.length > requiredLots * 1.2) {
+      warningMessage = `Over-selected lots. Required: ${requiredLots}, Selected: ${selectedLots.length}`
     }
 
     setSelectionStats({
-      requiredBales,
+      requiredBales: requiredLots,
       selectedBales: selectedLots.length,
       totalValue,
       brokerCommission,
@@ -258,8 +356,8 @@ const SalesProcessing = () => {
       
       // Update stats when selection changes
       const selectedLots = availableLots.filter(lot => newSelection.includes(lot.id))
-      const requiredBales = calculateRequiredLots(selectedOrder.requested_quantity)
-      updateSelectionStats(selectedLots, requiredBales, selectedOrder)
+      const requiredLots = calculateRequiredLots(selectedOrder.requested_quantity)
+      updateSelectionStats(selectedLots, requiredLots, selectedOrder)
       
       return newSelection
     })
@@ -267,10 +365,10 @@ const SalesProcessing = () => {
 
   // Validate selection and proceed
   const validateAndProceed = () => {
-    const requiredBales = calculateRequiredLots(selectedOrder.requested_quantity)
+    const requiredLots = calculateRequiredLots(selectedOrder.requested_quantity)
     
-    if (manualSelection.length < requiredBales) {
-      toast.error(`Please select at least ${requiredBales} lots (${selectedOrder.requested_quantity} tons × 6.12 bales/ton)`)
+    if (manualSelection.length < requiredLots) {
+      toast.error(`Please select at least ${requiredLots} lots`)
       return
     }
     
@@ -368,7 +466,7 @@ const SalesProcessing = () => {
           </div>
           {showNewOrderForm && (
             <form className="mt-4 space-y-4" onSubmit={submitNewOrder}>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-700">Customer</label>
                   <select
@@ -397,82 +495,160 @@ const SalesProcessing = () => {
                     ))}
                   </select>
                 </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700">Requested Quantity (tons)</label>
-                  <input
-                    type="number"
-                    className="input-field"
-                    value={newOrder.requested_quantity}
-                    onChange={e => handleNewOrderChange('requested_quantity', e.target.value)}
-                    min={1}
-                    step={0.01}
-                    required
-                  />
-                  <p className="text-xs text-gray-500 mt-1">
-                    Will require ~{newOrder.requested_quantity ? Math.ceil(newOrder.requested_quantity * 6.12) : 0} bales
-                  </p>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700">Lifting Period</label>
-                  <input
-                    type="text"
-                    className="input-field"
-                    value={newOrder.lifting_period}
-                    onChange={e => handleNewOrderChange('lifting_period', e.target.value)}
-                    placeholder="e.g., Dec 2024 - Jan 2025"
-                    required
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700">Priority Branch</label>
-                  <input
-                    type="text"
-                    className="input-field"
-                    value={newOrder.priority_branch}
-                    onChange={e => handleNewOrderChange('priority_branch', e.target.value)}
-                    placeholder="Optional: Preferred branch"
-                  />
-                </div>
               </div>
               {/* Line Items */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">Line Items</label>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Order Lines</label>
                 {newOrder.line_items.map((item, idx) => (
-                  <div key={idx} className="grid grid-cols-1 md:grid-cols-4 gap-2 mb-2 items-end">
-                    <input
-                      type="text"
-                      className="input-field"
-                      placeholder="Indent Number"
-                      value={item.indent_number}
-                      onChange={e => handleLineItemChange(idx, 'indent_number', e.target.value)}
-                      required
-                    />
-                    <input
-                      type="number"
-                      className="input-field"
-                      placeholder="Quantity (tons)"
-                      min={0.01}
-                      step={0.01}
-                      value={item.quantity}
-                      onChange={e => handleLineItemChange(idx, 'quantity', e.target.value)}
-                      required
-                    />
-                    <input
-                      type="number"
-                      className="input-field"
-                      placeholder="Commission Rate (%)"
-                      min={0}
-                      max={100}
-                      step={0.01}
-                      value={item.commission_rate}
-                      onChange={e => handleLineItemChange(idx, 'commission_rate', e.target.value)}
-                      required
-                    />
-                    <button type="button" className="btn-secondary" onClick={() => removeLineItem(idx)} disabled={newOrder.line_items.length === 1}>Remove</button>
+                  <div key={idx} className="border border-gray-200 rounded-lg p-4 mb-4">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Indent Number</label>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            className="input-field flex-1"
+                            placeholder="Enter indent number"
+                            value={item.indent_number}
+                            onChange={e => handleLineItemChange(idx, 'indent_number', e.target.value)}
+                            required
+                          />
+                          <button 
+                            type="button" 
+                            className="btn-secondary px-3"
+                            onClick={() => validateIndent(item.indent_number, idx)}
+                            disabled={!item.indent_number.trim()}
+                          >
+                            Validate
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Indent Details Display */}
+                    {item.indent_details && (
+                      <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4">
+                        <h4 className="font-medium text-blue-900 mb-2">Indent Details</h4>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                          <div>
+                            <span className="text-gray-600">Bales Quantity:</span>
+                            <p className="font-medium">{item.indent_details.bales_quantity}</p>
+                          </div>
+                          <div>
+                            <span className="text-gray-600">Available:</span>
+                            <p className="font-medium text-green-600">{item.indent_details.available_bales}</p>
+                          </div>
+                          <div>
+                            <span className="text-gray-600">Centre:</span>
+                            <p className="font-medium">{item.indent_details.centre_name}</p>
+                          </div>
+                          <div>
+                            <span className="text-gray-600">Branch:</span>
+                            <p className="font-medium">{item.indent_details.branch}</p>
+                          </div>
+                          <div>
+                            <span className="text-gray-600">Lifting Period:</span>
+                            <p className="font-medium">{item.indent_details.lifting_period}</p>
+                          </div>
+                          <div>
+                            <span className="text-gray-600">Fibre Length:</span>
+                            <p className="font-medium">{item.indent_details.fibre_length}</p>
+                          </div>
+                          <div>
+                            <span className="text-gray-600">Variety:</span>
+                            <p className="font-medium">{item.indent_details.variety}</p>
+                          </div>
+                          <div>
+                            <span className="text-gray-600">Bid Price:</span>
+                            <p className="font-medium">₹{item.indent_details.bid_price}</p>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Line Quantity and Brokerage */}
+                    {item.indent_details && (
+                      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Line Quantity (lots)</label>
+                          <input
+                            type="number"
+                            className="input-field"
+                            placeholder="Enter quantity in lots"
+                            min={1}
+                            max={item.indent_details.available_bales}
+                            value={item.quantity}
+                            onChange={e => handleLineItemChange(idx, 'quantity', e.target.value)}
+                            required
+                          />
+                          <p className="text-xs text-gray-500 mt-1">
+                            Max available: {item.indent_details.available_bales} lots
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Broker Brokerage per Bale</label>
+                          <input
+                            type="number"
+                            className="input-field"
+                            placeholder="₹ per bale"
+                            min={0}
+                            step={0.01}
+                            value={item.broker_brokerage_per_bale}
+                            onChange={e => handleLineItemChange(idx, 'broker_brokerage_per_bale', e.target.value)}
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Our Brokerage per Bale</label>
+                          <input
+                            type="number"
+                            className="input-field"
+                            placeholder="₹ per bale"
+                            min={0}
+                            step={0.01}
+                            value={item.our_brokerage_per_bale}
+                            onChange={e => handleLineItemChange(idx, 'our_brokerage_per_bale', e.target.value)}
+                            required
+                          />
+                        </div>
+                        <div className="flex items-end">
+                          <button 
+                            type="button" 
+                            className="btn-secondary w-full"
+                            onClick={() => removeLineItem(idx)} 
+                            disabled={newOrder.line_items.length === 1}
+                          >
+                            Remove Line
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ))}
-                <button type="button" className="btn-primary mt-2" onClick={addLineItem}>Add Line Item</button>
+                <button type="button" className="btn-primary mt-2" onClick={addLineItem}>Add Order Line</button>
               </div>
+
+              {/* Order Summary */}
+              {newOrder.line_items.some(item => item.indent_details && item.quantity) && (
+                <div className="bg-gray-50 border border-gray-200 rounded-lg p-4 mt-4">
+                  <h4 className="font-medium text-gray-900 mb-3">Order Summary</h4>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
+                    <div>
+                      <span className="text-gray-600">Total Lots:</span>
+                      <p className="font-medium text-lg">{calculateOrderTotals().totalLots}</p>
+                    </div>
+                    <div>
+                      <span className="text-gray-600">Total Broker Brokerage:</span>
+                      <p className="font-medium text-lg">₹{calculateOrderTotals().totalBrokerBrokerage.toFixed(2)}</p>
+                    </div>
+                    <div>
+                      <span className="text-gray-600">Total Our Brokerage:</span>
+                      <p className="font-medium text-lg">₹{calculateOrderTotals().totalOurBrokerage.toFixed(2)}</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div className="flex justify-end">
                 <button type="submit" className="btn-primary" disabled={creatingOrder}>
                   {creatingOrder ? 'Creating...' : 'Create Order'}
@@ -508,7 +684,7 @@ const SalesProcessing = () => {
               <div className="ml-3">
                 <p className="text-sm font-medium text-gray-500">Total Requested</p>
                 <p className="text-lg font-semibold text-gray-900">
-                  {pendingOrders.reduce((sum, order) => sum + order.requested_quantity, 0).toFixed(2)} tons
+                  {pendingOrders.reduce((sum, order) => sum + order.requested_quantity, 0)} lots
                 </p>
               </div>
             </div>
@@ -567,7 +743,7 @@ const SalesProcessing = () => {
                       <div>
                         <h4 className="font-medium text-gray-900">Requirements</h4>
                         <p className="text-sm text-gray-600">
-                          {order.requested_quantity} tons (~{Math.ceil(order.requested_quantity * 6.12)} bales)
+                          {order.requested_quantity} lots
                         </p>
                         <p className="text-xs text-gray-500">Period: {order.lifting_period}</p>
                         {order.line_specs && (
@@ -666,7 +842,7 @@ const SalesProcessing = () => {
             <div>
               <span className="font-medium text-gray-500">Requested Quantity:</span>
               <p className="text-gray-900">
-                {selectedOrder.requested_quantity} tons (~{selectionStats.requiredBales} bales)
+                {selectedOrder.requested_quantity} lots
               </p>
             </div>
             <div>
@@ -683,12 +859,12 @@ const SalesProcessing = () => {
         {/* Selection Summary */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-blue-50 p-4 rounded-lg text-center">
-            <p className="text-sm font-medium text-blue-600">Required Bales</p>
+            <p className="text-sm font-medium text-blue-600">Required Lots</p>
             <p className="text-2xl font-bold text-blue-900">{selectionStats.requiredBales}</p>
-            <p className="text-xs text-blue-600">({selectedOrder.requested_quantity} tons × 6.12)</p>
+            <p className="text-xs text-blue-600">Required lots</p>
           </div>
           <div className="bg-green-50 p-4 rounded-lg text-center">
-            <p className="text-sm font-medium text-green-600">Selected Bales</p>
+            <p className="text-sm font-medium text-green-600">Selected Lots</p>
             <p className="text-2xl font-bold text-green-900">{selectionStats.selectedBales}</p>
           </div>
           <div className="bg-purple-50 p-4 rounded-lg text-center">
@@ -885,15 +1061,15 @@ const SalesProcessing = () => {
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
                   <span className="text-gray-500">Requested Quantity:</span>
-                  <span className="text-gray-900">{selectedOrder.requested_quantity} tons</span>
+                  <span className="text-gray-900">{selectedOrder.requested_quantity} lots</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-gray-500">Required Bales:</span>
-                  <span className="text-gray-900">{selectionStats.requiredBales} bales</span>
+                  <span className="text-gray-500">Required Lots:</span>
+                  <span className="text-gray-900">{selectionStats.requiredBales} lots</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-gray-500">Selected Bales:</span>
-                  <span className="text-gray-900">{selectionStats.selectedBales} bales</span>
+                  <span className="text-gray-500">Selected Lots:</span>
+                  <span className="text-gray-900">{selectionStats.selectedBales} lots</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-500">Total Value:</span>
